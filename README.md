@@ -119,6 +119,32 @@ starting the server.
 Uploaded files are written to `./uploads` (configurable via `UPLOAD_DIR`
 in `.env`).
 
+## Running with Docker
+
+If you'd rather not install Node locally, `docker compose` builds and runs
+both services:
+
+```bash
+docker compose up --build
+```
+
+- Backend: http://localhost:4000 (SQLite + uploads persisted in named
+  volumes `backend_data` / `backend_uploads`, so they survive
+  `docker compose down` / rebuilds - use `docker compose down -v` to wipe
+  them)
+- Frontend: http://localhost:8080 (nginx serves the built static app and
+  proxies `/api/*` to the backend container - see `frontend/nginx.conf`)
+
+Each service has its own multi-stage Dockerfile (`Dockerfile` for the
+backend, `frontend/Dockerfile` for the frontend): a build stage compiles
+TypeScript / runs the Vite build, and the runtime stage only ships the
+compiled output plus production dependencies, so the final images don't
+carry the TypeScript compiler or dev tooling.
+
+Running tests still uses the local Node setup below (`npm test`) rather
+than Docker - there's no test stage in these Dockerfiles by design, to keep
+the runtime image lean.
+
 ## Running tests
 
 ```bash
