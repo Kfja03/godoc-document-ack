@@ -1,14 +1,17 @@
 # GoDoc Take-Home Assessment - Document Upload & Acknowledgement
 
-A simplified flow where a consultation-related document is uploaded by one
-party and acknowledged (or rejected) by a second party.
+A role-based flow where consultants upload consultation-related documents
+and approvers acknowledge or reject them, with visibility rules scoped by
+who uploaded what and who's allowed to approve.
 
 ## Contents
 
 - [Tech stack & why](#tech-stack--why)
 - [Architecture](#architecture)
+- [Authentication & roles](#authentication--roles)
 - [State machine](#state-machine)
 - [Setup & run](#setup--run)
+- [Running with Docker](#running-with-docker)
 - [Running tests](#running-tests)
 - [API overview](#api-overview)
 - [Assumptions](#assumptions)
@@ -19,42 +22,102 @@ party and acknowledged (or rejected) by a second party.
 
 | Layer | Choice | Why |
 |---|---|---|
-| Backend | Node.js + Express + TypeScript | Small, well-understood surface area for a scoped assessment; TypeScript catches the kind of state/typo mistakes that matter in a state-machine-heavy flow. |
-| Database | SQLite via Node's built-in `node:sqlite` | Zero external services to stand up, single file, and it's built into Node 22+ so `npm install` never touches a native compiler or the network. A traditional choice here would be `better-sqlite3` (native binding) or Postgres; I moved off `better-sqlite3` specifically because it requires downloading prebuilt binaries / building from source, which is a real point of setup friction on a reviewer's machine. For a real production system handling many documents and reviewers, I'd move to Postgres for proper concurrent-write throughput, connection pooling, and easier hosting - noted in "known limitations" below. |
-| File storage | Local disk (`multer.diskStorage`) | Simplest thing that works for a take-home; metadata (filename, mime type, size, status) lives in the DB, the file itself lives in `/uploads` referenced by a generated filename (never trusts the original filename for the on-disk path, to avoid path traversal / collisions). In production this would be S3 (or GCS) with the DB storing the object key, so app servers stay stateless. |
-| Frontend | React + Vite + TypeScript | Minimal build setup, fast dev loop, and satisfies the "modern JS framework" bonus without pulling in a full Next.js app for what's ultimately three screens' worth of UI. |
-| Tests | Jest + Supertest | Standard Node testing stack; Supertest lets me test the real Express app (routing, middleware, validation, status codes) without spinning up a live server. |
+| Backend | Node.js + Express + TypeScript | Small, well-understood surface area for a scoped assessment; TypeScript catches the kind of state/typo mistakes that matter in a state-machine-heavy flow with role checks layered on top. |
+| Database | SQLite via Node's built-in `node:sqlite` | Zero external services to stand up, single file, and it's built into Node 22+ so `npm install` never touches a native compiler or the network. I moved off `better-sqlite3` (the more typical choice) specifically because it requires downloading prebuilt binaries / building from source, which is a real point of setup friction on a reviewer's machine. For a real production system I'd move to Postgres - noted in "known limitations" below. |
+| Auth | `bcryptjs` + `jsonwebtoken`, JWT in an httpOnly cookie | No external auth provider needed for a scoped assessment, but still real password hashing and a real signed session token rather than a trust-the-client name field. httpOnly means the token isn't readable from JS (mitigates XSS token theft); `bcryptjs` is pure JS (same native-build-avoidance reasoning as the SQLite choice above). |
+| File storage | Local disk (`multer.diskStorage`) | Simplest thing that works for a take-home; metadata lives in the DB, the file itself lives in `/uploads` referenced by a generated filename (never trusts the original filename for the on-disk path). In production this would be S3/GCS with the DB storing the object key. |
+| Frontend | React + Vite + TypeScript | Minimal build setup, fast dev loop, satisfies the "modern JS framework" bonus without the overhead of a full Next.js app for what's a handful of screens. |
+| Tests | Jest + Supertest | Supertest drives the real Express app (routing, middleware, auth, validation, status codes) without spinning up a live server, and its `.agent()` persists cookies across requests so multi-step "login, then act" flows are easy to test. |
 
 ## Architecture
 
 ```
-frontend/        Vite + React SPA. Talks to the API via same-origin
-                  fetch("/api/...") - the Vite dev server proxies /api to
-                  the Express backend (see frontend/vite.config.ts) so there
-                  is no CORS dance in local dev.
+frontend/
+  src/App.tsx       Auth-gated shell: shows Login until a session exists,
+                     then the workspace (upload panel + document grid)
+  src/Login.tsx      Login form + one-click demo account fill-in
+  src/api.ts         Typed fetch wrappers, all with credentials: "include"
+
 src/
-  app.ts          Express app wiring (middleware, routes, error handler)
-  server.ts       Boots the app on PORT
-  db/index.ts     SQLite connection + schema (idempotent CREATE TABLE)
+  app.ts             Express app wiring (middleware, routes, error handler)
+  server.ts          Boots the app on PORT; auto-seeds demo users if the
+                      users table is empty (so `docker compose up` works
+                      with zero extra steps)
+  db/
+    index.ts          SQLite connection + schema (idempotent CREATE TABLE)
+    demoUsers.ts       Shared demo account list (used by seed.ts and the
+                        auto-seed-if-empty check in server.ts)
+    seed.ts            `npm run seed` - explicit one-off seeding
   lib/
-    validation.ts Upload validation (mime type allowlist, size limit)
-    stateMachine.ts  Pure, declarative transition table for document status
-    documents.ts   Data access + the actual transition logic
+    validation.ts      Upload validation (mime type allowlist, size limit)
+    stateMachine.ts     Pure, declarative transition table for document status
+    roles.ts            canUpload() / canApprove() - the only place role
+                         logic is defined, so it can't drift between routes
+    users.ts             User creation, lookup, password hashing/verification
+    tokens.ts             JWT sign/verify
+    documents.ts           Data access, visibility filtering, transitions
+  middleware/
+    auth.ts             requireAuth, requireUploadCapability,
+                         requireApproveCapability
   routes/
-    documents.ts   REST endpoints (upload, list, get, download, acknowledge, reject)
-tests/            Unit tests (validation, state machine) + integration
-                  tests (full HTTP flow via Supertest)
+    auth.ts              login, logout, me
+    documents.ts           upload, list, get, download, acknowledge, reject
+tests/                 Unit tests (validation, state machine) + integration
+                       tests (full HTTP flow via Supertest, including auth
+                       and role enforcement)
 ```
 
-The backend is a single Express process today. The reason it's split into
-`lib/validation.ts`, `lib/stateMachine.ts`, and `lib/documents.ts` as
-separate, independently-testable modules (rather than one big route
-handler) is specifically so it can grow: a new document type, a new
-validation rule, or a new terminal state (e.g. `EXPIRED`) is a change in one
-module, not a rewrite of the route layer. If this needed to scale past a
-single process, the natural next step is extracting `lib/` into a package
-that a booking service or a notifications service could also import,
-without touching the HTTP layer at all.
+The backend is a single Express process. Role logic lives in exactly one
+place (`lib/roles.ts`) and visibility logic in exactly one place
+(`listDocumentsForUser` / `canUserSeeDocument` in `lib/documents.ts`) -
+routes call into these rather than re-implementing the rules, so adding a
+fourth role or a fourth visibility case later is a change in one function,
+not a hunt through every route handler.
+
+## Authentication & roles
+
+Every user has exactly one role, set at account creation (there's no
+self-signup - see "known limitations"):
+
+| Role | Can upload? | Can acknowledge/reject? | Can see |
+|---|---|---|---|
+| `UPLOAD_ONLY` | Yes | No | Their own documents in any status, **plus** any document from anyone that's been `ACKNOWLEDGED` |
+| `APPROVE_ONLY` | No | Yes | Every document, any status, any uploader |
+| `UPLOAD_AND_APPROVE` | Yes | Yes | Every document, any status, any uploader |
+
+This is enforced in two independent places, deliberately:
+
+1. **Route-level capability checks** (`requireUploadCapability` /
+   `requireApproveCapability` middleware) - a `POST /api/documents` from a
+   user without upload capability never even reaches the upload logic; it
+   gets a `403` immediately.
+2. **Row-level visibility filtering** (`listDocumentsForUser`,
+   `canUserSeeDocument`) - this is the part that actually answers "upload
+   only should only see their own uploaded files, approved or pending,
+   plus every approved file from anyone." It's applied in the SQL query
+   for `GET /api/documents` (so the list is correct) *and* independently
+   re-checked on `GET /api/documents/:id` and the download route (so
+   guessing a document's UUID doesn't bypass the list-level filtering -
+   both return `404`, not `403`, for a document you're not allowed to know
+   exists).
+
+Sessions are a JWT stored in an httpOnly cookie (`godoc_session`), issued on
+login and verified on every request via the `requireAuth` middleware. The
+frontend never touches the token directly - it just calls `/api/auth/me` on
+load to figure out whether there's a valid session.
+
+**Demo accounts** (password for all: `password123`), auto-seeded on first
+boot (or run `npm run seed` explicitly):
+
+| Email | Role |
+|---|---|
+| `alice@godoc.test` | Upload only |
+| `dana@godoc.test` | Upload only |
+| `bob@godoc.test` | Approve only |
+| `carol@godoc.test` | Upload & approve |
+
+The login screen has one-click buttons to fill these in, since a reviewer
+will likely want to try more than one role.
 
 ## State machine
 
@@ -70,27 +133,26 @@ UPLOADED ─────────────► ACKNOWLEDGED   (terminal)
   which it can transition.
 - `ACKNOWLEDGED` and `REJECTED` are both terminal. I added `REJECTED` beyond
   what's strictly required ("uploaded → acknowledged") because a real
-  reviewer needs a way to say "this is the wrong document" - modeling only
-  the happy path felt like it'd miss the point of "reason about correctness
-  under ... transitions."
+  reviewer needs a way to say "this is the wrong document."
 - Transitions are defined once, declaratively, in `src/lib/stateMachine.ts`
-  (`canTransition` / `nextState`), and the route handlers never set
-  `status` directly - they always go through this module. Adding a new
-  state later means editing one transition table, not hunting through
-  route handlers for every place `status` gets written.
-- **Concurrency correctness on transitions**: this option doesn't have the
-  same double-booking risk as the booking-system option, but the same
-  failure mode exists in miniature - two requests could race to act on the
-  same document (double-click, two open tabs, a retried request). I handle
-  this with an atomic conditional update: `UPDATE documents SET status = ...
-  WHERE id = ? AND status = 'UPLOADED'` (see `applyTransition` in
-  `src/lib/documents.ts`). If two acknowledge/reject requests race, exactly
-  one `UPDATE` actually changes a row (`changes = 1`); the loser sees
-  `changes = 0` and gets a `409 Conflict` instead of silently overwriting
-  the winner's decision. This is covered by an integration test that fires
-  two concurrent acknowledge requests and asserts exactly one succeeds
-  (`tests/documents.integration.test.ts`, "only allows one of two
-  concurrent acknowledge requests to succeed").
+  (`canTransition` / `nextState`); route handlers never set `status`
+  directly.
+- **Who can act, and who they're recorded as**: the actor is always the
+  authenticated session user (`req.user.id`), never a client-supplied
+  name - `acknowledged_by_id` / `rejected_by_id` are foreign keys to
+  `users`, and the API joins in the name for display. This closes a gap in
+  an earlier version of this project where "who acted" was just a free-text
+  field the client could set to anything.
+- **Concurrency correctness on transitions**: two requests could race to
+  act on the same document (double-click, two open tabs, a retried
+  request). This is handled with an atomic conditional update:
+  `UPDATE documents SET status = ... WHERE id = ? AND status = 'UPLOADED'`
+  (see `applyTransition` in `src/lib/documents.ts`). If two
+  acknowledge/reject requests race, exactly one `UPDATE` actually changes a
+  row; the loser sees `changes = 0` and gets a `409 Conflict` instead of
+  silently overwriting the winner's decision. Covered by an integration
+  test that fires two concurrent acknowledge requests from two different
+  approvers and asserts exactly one succeeds.
 
 ## Setup & run
 
@@ -100,50 +162,42 @@ UPLOADED ─────────────► ACKNOWLEDGED   (terminal)
 # 1. Backend
 npm install
 npm run build
-npm start            # http://localhost:4000
+npm run seed         # creates the demo accounts (optional - the server
+                      # auto-seeds on first boot if the users table is empty)
+npm start             # http://localhost:4000
 
 # 2. Frontend (separate terminal)
 cd frontend
 npm install
-npm run dev           # http://localhost:5173, proxies /api to :4000
+npm run dev            # http://localhost:5173, proxies /api to :4000
 ```
 
 For local iteration, `npm run dev` in the project root runs the backend
 with hot reload (`ts-node-dev`) instead of `npm run build && npm start`.
 
 The SQLite schema is created automatically on first run (idempotent
-`CREATE TABLE IF NOT EXISTS`, see `src/db/index.ts`). There's also an
-explicit `npm run migrate` if you want to create the DB file without
-starting the server.
+`CREATE TABLE IF NOT EXISTS`, see `src/db/index.ts`).
 
-Uploaded files are written to `./uploads` (configurable via `UPLOAD_DIR`
-in `.env`).
+Uploaded files are written to `./uploads` (configurable via `UPLOAD_DIR` in
+`.env`).
 
 ## Running with Docker
-
-If you'd rather not install Node locally, `docker compose` builds and runs
-both services:
 
 ```bash
 docker compose up --build
 ```
 
-- Backend: http://localhost:4000 (SQLite + uploads persisted in named
-  volumes `backend_data` / `backend_uploads`, so they survive
-  `docker compose down` / rebuilds - use `docker compose down -v` to wipe
-  them)
-- Frontend: http://localhost:8080 (nginx serves the built static app and
-  proxies `/api/*` to the backend container - see `frontend/nginx.conf`)
+- Backend: http://localhost:4000 - auto-seeds the demo accounts above on
+  first boot, no extra step needed. SQLite + uploads persist in named
+  volumes (`backend_data` / `backend_uploads`) across restarts/rebuilds -
+  use `docker compose down -v` to wipe them and start fresh.
+- Frontend: http://localhost:8080 - nginx serves the built static app and
+  proxies `/api/*` to the backend container (see `frontend/nginx.conf`),
+  so the session cookie stays same-origin from the browser's perspective.
 
-Each service has its own multi-stage Dockerfile (`Dockerfile` for the
-backend, `frontend/Dockerfile` for the frontend): a build stage compiles
+Each service has its own multi-stage Dockerfile: a build stage compiles
 TypeScript / runs the Vite build, and the runtime stage only ships the
-compiled output plus production dependencies, so the final images don't
-carry the TypeScript compiler or dev tooling.
-
-Running tests still uses the local Node setup below (`npm test`) rather
-than Docker - there's no test stage in these Dockerfiles by design, to keep
-the runtime image lean.
+compiled output plus production dependencies.
 
 ## Running tests
 
@@ -151,83 +205,30 @@ the runtime image lean.
 npm test
 ```
 
-17 tests: unit tests for validation rules and the state machine transition
-table, plus integration tests that exercise the real Express app end to end
-(upload → acknowledge, upload → reject, invalid file type/size, acting on a
-document that doesn't exist, and the concurrent-acknowledge race test
-described above). Each test file gets its own throwaway SQLite file and
-upload directory (`tests/setupEnv.ts`) so tests never interfere with each
-other or with `data/dev.db`.
+24 tests: unit tests for validation rules and the state machine transition
+table, plus integration tests covering auth (login success/failure, `/me`,
+logout), capability enforcement (upload-only blocked from
+acknowledging/rejecting with `403`, approve-only blocked from uploading),
+document visibility per role (including that a hidden document 404s even
+when fetched directly by ID, not just filtered out of the list), search and
+status filtering, the full upload → acknowledge/reject lifecycle, and the
+concurrent-acknowledge race test. Each test file gets its own throwaway
+SQLite file and upload directory (`tests/setupEnv.ts`), and every test
+within `documents.integration.test.ts` clears the `documents`/`users`
+tables in `beforeEach` so tests can assert exact visible-document lists
+without leaking state between cases.
 
 ## API overview
 
-| Method | Route | Description |
-|---|---|---|
-| GET | `/api/health` | Liveness check |
-| POST | `/api/documents` | Upload a document. `multipart/form-data`: `file`, `uploaderName`, `intendedRecipient`. Returns `201` + the document, or `400` with `{ errors: string[] }` on validation failure. |
-| GET | `/api/documents` | List all documents, most recent first |
-| GET | `/api/documents/:id` | Get one document's metadata |
-| GET | `/api/documents/:id/download` | Download the original file |
-| POST | `/api/documents/:id/acknowledge` | Body: `{ actor: string }`. `200` + updated document, `409` if not currently `UPLOADED`, `404` if not found |
-| POST | `/api/documents/:id/reject` | Body: `{ actor: string, reason?: string }`. Same status codes as acknowledge |
-
-## Assumptions
-
-- **No authentication.** Uploader and reviewer identify themselves by
-  typing their name into the form (`uploaderName` / `intendedRecipient` /
-  `actor`). This is explicitly a shortcut - see limitations below.
-- **`intendedRecipient` is informational, not enforced.** Anyone can
-  acknowledge or reject any document by typing an actor name; the system
-  doesn't check that the actor matches the intended recipient. Enforcing
-  that properly requires real auth (see below).
-- **Allowed file types**: PDF, PNG, JPEG, DOC, DOCX. Max size 10MB. Both
-  configurable via `.env` (`ALLOWED_MIME_TYPES`, `MAX_FILE_SIZE_MB`).
-- **One document, one decision.** A document can only be acknowledged or
-  rejected once. There's no "re-open" or "re-upload a corrected version"
-  flow - a rejected document just sits there rejected. A real product would
-  probably want a "superseded by" link to a re-upload.
-- **Single reviewer per document.** The schema assumes one
-  `intendedRecipient`; it doesn't model multiple people needing to sign off.
-
-## Known limitations & what I'd add next
-
-- **Auth.** This is the biggest one. Right now identity is a free-text
-  name, which is fine for demonstrating the state machine and validation
-  but would need to be replaced with real sessions/JWT + a `users` table
-  before this could go anywhere near production, so that `intendedRecipient`
-  can actually be enforced server-side instead of trusted from the client.
-- **File storage.** Local disk works for one instance; it does not work if
-  this app ever runs on more than one server/container, since the file
-  would only exist on whichever instance handled the upload. I'd swap
-  `multer.diskStorage` for an S3-compatible object store and store just the
-  object key in the DB - the `documents` table and API shape barely change.
-- **SQLite → Postgres.** SQLite is genuinely fine for this assessment's
-  scope, but a single-file database is a ceiling: no read replicas, limited
-  concurrent-write throughput, awkward to run across multiple app
-  instances. Because all DB access already goes through
-  `src/lib/documents.ts`, swapping the driver is contained to that file and
-  `src/db/index.ts` - the routes and the state machine don't know or care
-  what database is underneath.
-- **No virus/malware scanning on uploads.** For a real healthcare-adjacent
-  product handling documents from patients, I'd add a scanning step
-  (e.g. ClamAV or a cloud AV API) before a file is considered "uploaded"
-  rather than trusting mime-type sniffing alone.
-- **No pagination on `GET /api/documents`.** Fine at demo scale, would need
-  cursor-based pagination once document volume grows.
-- **HRM/notification hooks.** Not built - see the assessment's scope 3 for
-  the kind of external-system integration this would eventually need
-  (e.g. notifying the intended recipient by email that a document is
-  waiting). I left this out to keep the core flow's correctness the focus,
-  per the assessment's own guidance to prioritize depth on what's built
-  over breadth.
-
-## A note on the committed `.env`
-
-The assessment brief explicitly asks for the environment variable(s) to be
-committed to the repository, so `.env` is checked in rather than
-git-ignored. In a real codebase I would not do this - `.env` would hold
-secrets (DB credentials, API keys) and belong in `.gitignore` with a
-`.env.example` committed instead. Here it only holds non-secret local
-config (port, file size limit, upload directory, DB path), so committing it
-is low-risk, but I wanted to flag that this is a deliberate exception to
-normal practice, not an oversight.
+| Method | Route | Auth | Description |
+|---|---|---|---|
+| GET | `/api/health` | none | Liveness check |
+| POST | `/api/auth/login` | none | Body: `{ email, password }`. Sets the session cookie, returns `{ user }`. `401` on bad credentials. |
+| POST | `/api/auth/logout` | session | Clears the session cookie |
+| GET | `/api/auth/me` | session | Returns `{ user }` for the current session, `401` if not logged in |
+| POST | `/api/documents` | session + upload capability | `multipart/form-data`: `file`. Uploader is taken from the session, not the request body. `403` without upload capability, `400` on invalid file. |
+| GET | `/api/documents?status=&search=` | session | Documents visible to the caller (see visibility rules above); optional status filter and filename search, both applied server-side |
+| GET | `/api/documents/:id` | session | `404` if the document doesn't exist *or* isn't visible to the caller - the two are indistinguishable on purpose |
+| GET | `/api/documents/:id/download` | session | Same visibility check as above |
+| POST | `/api/documents/:id/acknowledge` | session + approve capability | `200` + updated document, `409` if not currently `UPLOADED`, `403` without approve capability |
+| POST | `/api/documents/:id/

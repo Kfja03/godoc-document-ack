@@ -6,11 +6,14 @@ import { v4 as uuidv4 } from "uuid";
 import { validateUpload } from "../lib/validation";
 import {
   acknowledgeDocument,
+  canUserSeeDocument,
   createDocument,
-  getDocument,
-  listDocuments,
+  getDocumentRow,
+  listDocumentsForUser,
   rejectDocument,
 } from "../lib/documents";
+import { requireAuth, requireApproveCapability, requireUploadCapability } from "../middleware/auth";
+import type { DocumentStatus } from "../lib/stateMachine";
 
 const uploadDir = process.env.UPLOAD_DIR || "./uploads";
 fs.mkdirSync(uploadDir, { recursive: true });
@@ -29,20 +32,16 @@ const upload = multer({
 });
 
 const router = Router();
+router.use(requireAuth);
 
-// POST /api/documents - upload a document
-router.post("/", upload.single("file"), (req: Request, res: Response) => {
+const VALID_STATUSES: DocumentStatus[] = ["UPLOADED", "ACKNOWLEDGED", "REJECTED"];
+
+// POST /api/documents - upload a document (requires upload capability)
+router.post("/", requireUploadCapability, upload.single("file"), (req: Request, res: Response) => {
   const file = req.file;
-  const { uploaderName, intendedRecipient } = req.body;
 
   if (!file) {
     return res.status(400).json({ errors: ["No file was provided (field name must be 'file')."] });
-  }
-  if (!uploaderName || !intendedRecipient) {
-    fs.unlink(file.path, () => {});
-    return res
-      .status(400)
-      .json({ errors: ["uploaderName and intendedRecipient are both required."] });
   }
 
   const validation = validateUpload({
@@ -61,39 +60,47 @@ router.post("/", upload.single("file"), (req: Request, res: Response) => {
     storedFilename: file.filename,
     mimeType: file.mimetype,
     sizeBytes: file.size,
-    uploaderName,
-    intendedRecipient,
+    uploaderId: req.user!.id,
   });
 
   return res.status(201).json(doc);
 });
 
-// GET /api/documents - list all documents
-router.get("/", (_req: Request, res: Response) => {
-  return res.json(listDocuments());
+// GET /api/documents?status=&search= - list documents visible to the caller
+router.get("/", (req: Request, res: Response) => {
+  const statusParam = typeof req.query.status === "string" ? req.query.status.toUpperCase() : undefined;
+  const status =
+    statusParam && (VALID_STATUSES as string[]).includes(statusParam)
+      ? (statusParam as DocumentStatus)
+      : undefined;
+  const search = typeof req.query.search === "string" ? req.query.search.trim() : undefined;
+
+  const docs = listDocumentsForUser(req.user!, { status, search: search || undefined });
+  return res.json(docs);
 });
 
-// GET /api/documents/:id - get one document
+// GET /api/documents/:id
 router.get("/:id", (req: Request, res: Response) => {
-  const doc = getDocument(req.params.id);
-  if (!doc) return res.status(404).json({ error: "Document not found." });
+  const doc = getDocumentRow(req.params.id);
+  if (!doc || !canUserSeeDocument(req.user!, doc)) {
+    return res.status(404).json({ error: "Document not found." });
+  }
   return res.json(doc);
 });
 
-// GET /api/documents/:id/download - download the file
+// GET /api/documents/:id/download
 router.get("/:id/download", (req: Request, res: Response) => {
-  const doc = getDocument(req.params.id);
-  if (!doc) return res.status(404).json({ error: "Document not found." });
+  const doc = getDocumentRow(req.params.id);
+  if (!doc || !canUserSeeDocument(req.user!, doc)) {
+    return res.status(404).json({ error: "Document not found." });
+  }
   const filePath = path.join(uploadDir, doc.stored_filename);
   return res.download(filePath, doc.original_filename);
 });
 
-// POST /api/documents/:id/acknowledge
-router.post("/:id/acknowledge", (req: Request, res: Response) => {
-  const { actor } = req.body;
-  if (!actor) return res.status(400).json({ error: "actor is required." });
-
-  const result = acknowledgeDocument(req.params.id, actor);
+// POST /api/documents/:id/acknowledge (requires approval capability)
+router.post("/:id/acknowledge", requireApproveCapability, (req: Request, res: Response) => {
+  const result = acknowledgeDocument(req.params.id, req.user!.id);
   if (!result.ok) {
     if (result.reason === "NOT_FOUND") return res.status(404).json({ error: "Document not found." });
     return res.status(409).json({
@@ -103,12 +110,10 @@ router.post("/:id/acknowledge", (req: Request, res: Response) => {
   return res.json(result.document);
 });
 
-// POST /api/documents/:id/reject
-router.post("/:id/reject", (req: Request, res: Response) => {
-  const { actor, reason } = req.body;
-  if (!actor) return res.status(400).json({ error: "actor is required." });
-
-  const result = rejectDocument(req.params.id, actor, reason);
+// POST /api/documents/:id/reject (requires approval capability)
+router.post("/:id/reject", requireApproveCapability, (req: Request, res: Response) => {
+  const { reason } = req.body || {};
+  const result = rejectDocument(req.params.id, req.user!.id, reason);
   if (!result.ok) {
     if (result.reason === "NOT_FOUND") return res.status(404).json({ error: "Document not found." });
     return res.status(409).json({

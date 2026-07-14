@@ -1,13 +1,18 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { DragEvent, FormEvent } from "react";
-import type { DocumentRecord } from "./api";
+import type { CurrentUser, DocumentRecord } from "./api";
 import {
   acknowledgeDocument,
+  canApprove,
+  canUpload,
   downloadUrl,
+  fetchCurrentUser,
   listDocuments,
+  logout,
   rejectDocument,
   uploadDocument,
 } from "./api";
+import Login from "./Login";
 
 type Filter = "ALL" | "UPLOADED" | "ACKNOWLEDGED" | "REJECTED";
 
@@ -26,6 +31,12 @@ function StatusBadge({ status }: { status: DocumentRecord["status"] }) {
       {label}
     </span>
   );
+}
+
+function RoleTag({ role }: { role: CurrentUser["role"] }) {
+  const label =
+    role === "UPLOAD_ONLY" ? "Upload only" : role === "APPROVE_ONLY" ? "Approve only" : "Upload & approve";
+  return <span className="role-tag">{label}</span>;
 }
 
 function fileKindIcon(mimeType: string) {
@@ -54,25 +65,51 @@ function timeAgo(iso: string): string {
 }
 
 export default function App() {
+  // undefined = still checking session, null = not logged in
+  const [currentUser, setCurrentUser] = useState<CurrentUser | null | undefined>(undefined);
+
+  useEffect(() => {
+    fetchCurrentUser().then(setCurrentUser);
+  }, []);
+
+  if (currentUser === undefined) {
+    return (
+      <div className="boot-screen">
+        <span className="spinner spinner-dark" />
+      </div>
+    );
+  }
+
+  if (currentUser === null) {
+    return <Login onLogin={setCurrentUser} />;
+  }
+
+  return <Workspace user={currentUser} onLogout={() => setCurrentUser(null)} />;
+}
+
+function Workspace({ user, onLogout }: { user: CurrentUser; onLogout: () => void }) {
   const [documents, setDocuments] = useState<DocumentRecord[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [filter, setFilter] = useState<Filter>("ALL");
+  const [search, setSearch] = useState("");
 
-  const [uploaderName, setUploaderName] = useState("");
-  const [intendedRecipient, setIntendedRecipient] = useState("");
   const [file, setFile] = useState<File | null>(null);
   const [dragActive, setDragActive] = useState(false);
   const [uploading, setUploading] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  const [actorById, setActorById] = useState<Record<string, string>>({});
   const [reasonById, setReasonById] = useState<Record<string, string>>({});
   const [busyId, setBusyId] = useState<string | null>(null);
 
   async function refresh() {
     try {
-      setDocuments(await listDocuments());
+      setDocuments(
+        await listDocuments({
+          status: filter === "ALL" ? undefined : filter,
+          search: search || undefined,
+        })
+      );
       setError(null);
     } catch (e) {
       setError((e as Error).message);
@@ -82,8 +119,11 @@ export default function App() {
   }
 
   useEffect(() => {
-    refresh();
-  }, []);
+    setLoading(true);
+    const t = setTimeout(refresh, search ? 250 : 0); // light debounce on search typing
+    return () => clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [filter, search]);
 
   const counts = useMemo(() => {
     return {
@@ -93,11 +133,6 @@ export default function App() {
       REJECTED: documents.filter((d) => d.status === "REJECTED").length,
     };
   }, [documents]);
-
-  const visibleDocuments = useMemo(
-    () => (filter === "ALL" ? documents : documents.filter((d) => d.status === filter)),
-    [documents, filter]
-  );
 
   function pickFile(f: File | null) {
     setFile(f);
@@ -113,14 +148,12 @@ export default function App() {
 
   async function handleUpload(e: FormEvent) {
     e.preventDefault();
-    if (!file || !uploaderName || !intendedRecipient) return;
+    if (!file) return;
     setUploading(true);
     setError(null);
     try {
-      await uploadDocument(file, uploaderName, intendedRecipient);
+      await uploadDocument(file);
       pickFile(null);
-      setUploaderName("");
-      setIntendedRecipient("");
       if (fileInputRef.current) fileInputRef.current.value = "";
       await refresh();
     } catch (e) {
@@ -131,15 +164,10 @@ export default function App() {
   }
 
   async function handleAcknowledge(doc: DocumentRecord) {
-    const actor = actorById[doc.id]?.trim();
-    if (!actor) {
-      setError("Enter your name before acknowledging.");
-      return;
-    }
     setBusyId(doc.id);
     setError(null);
     try {
-      await acknowledgeDocument(doc.id, actor);
+      await acknowledgeDocument(doc.id);
       await refresh();
     } catch (e) {
       setError((e as Error).message);
@@ -149,15 +177,10 @@ export default function App() {
   }
 
   async function handleReject(doc: DocumentRecord) {
-    const actor = actorById[doc.id]?.trim();
-    if (!actor) {
-      setError("Enter your name before rejecting.");
-      return;
-    }
     setBusyId(doc.id);
     setError(null);
     try {
-      await rejectDocument(doc.id, actor, reasonById[doc.id] || "");
+      await rejectDocument(doc.id, reasonById[doc.id] || "");
       await refresh();
     } catch (e) {
       setError((e as Error).message);
@@ -166,12 +189,20 @@ export default function App() {
     }
   }
 
+  async function handleLogout() {
+    await logout();
+    onLogout();
+  }
+
   const filters: { key: Filter; label: string }[] = [
     { key: "ALL", label: "All" },
     { key: "UPLOADED", label: "Awaiting review" },
     { key: "ACKNOWLEDGED", label: "Acknowledged" },
     { key: "REJECTED", label: "Rejected" },
   ];
+
+  const showUpload = canUpload(user.role);
+  const showApprove = canApprove(user.role);
 
   return (
     <div className="page">
@@ -182,6 +213,15 @@ export default function App() {
             <h1>Document Upload &amp; Acknowledgement</h1>
             <p className="subtitle">Consultation-related document flow</p>
           </div>
+        </div>
+        <div className="user-block">
+          <div className="user-identity">
+            <span className="user-name">{user.name}</span>
+            <RoleTag role={user.role} />
+          </div>
+          <button className="logout-btn" onClick={handleLogout}>
+            Sign out
+          </button>
         </div>
       </header>
 
@@ -194,70 +234,66 @@ export default function App() {
         </div>
       )}
 
-      <div className="layout">
-        <aside className="panel upload-panel">
-          <h2>Upload a document</h2>
-          <form onSubmit={handleUpload} className="upload-form">
-            <label>
-              Your name (uploader)
-              <input value={uploaderName} onChange={(e) => setUploaderName(e.target.value)} required />
-            </label>
-            <label>
-              Intended recipient
-              <input
-                value={intendedRecipient}
-                onChange={(e) => setIntendedRecipient(e.target.value)}
-                required
-              />
-            </label>
+      <div className={`layout ${showUpload ? "" : "layout-no-upload"}`}>
+        {showUpload && (
+          <aside className="panel upload-panel">
+            <h2>Upload a document</h2>
+            <form onSubmit={handleUpload} className="upload-form">
+              <label>File</label>
+              <div
+                className={`dropzone ${dragActive ? "dropzone-active" : ""} ${file ? "dropzone-filled" : ""}`}
+                onDragOver={(e) => {
+                  e.preventDefault();
+                  setDragActive(true);
+                }}
+                onDragLeave={() => setDragActive(false)}
+                onDrop={handleDrop}
+                onClick={() => fileInputRef.current?.click()}
+              >
+                {file ? (
+                  <>
+                    <span className="dropzone-icon">{fileKindIcon(file.type)}</span>
+                    <span className="dropzone-title">{file.name}</span>
+                    <span className="dropzone-hint">{formatBytes(file.size)} - click or drop to replace</span>
+                  </>
+                ) : (
+                  <>
+                    <span className="dropzone-icon">⬆️</span>
+                    <span className="dropzone-title">Drag & drop a file here</span>
+                    <span className="dropzone-hint">or click to browse - PDF, PNG, JPG, DOC, DOCX, max 10MB</span>
+                  </>
+                )}
+                <input
+                  ref={fileInputRef}
+                  className="visually-hidden"
+                  type="file"
+                  onChange={(e) => pickFile(e.target.files?.[0] ?? null)}
+                />
+              </div>
 
-            <label>File</label>
-            <div
-              className={`dropzone ${dragActive ? "dropzone-active" : ""} ${file ? "dropzone-filled" : ""}`}
-              onDragOver={(e) => {
-                e.preventDefault();
-                setDragActive(true);
-              }}
-              onDragLeave={() => setDragActive(false)}
-              onDrop={handleDrop}
-              onClick={() => fileInputRef.current?.click()}
-            >
-              {file ? (
-                <>
-                  <span className="dropzone-icon">{fileKindIcon(file.type)}</span>
-                  <span className="dropzone-title">{file.name}</span>
-                  <span className="dropzone-hint">{formatBytes(file.size)} - click or drop to replace</span>
-                </>
-              ) : (
-                <>
-                  <span className="dropzone-icon">⬆️</span>
-                  <span className="dropzone-title">Drag & drop a file here</span>
-                  <span className="dropzone-hint">or click to browse - PDF, PNG, JPG, DOC, DOCX, max 10MB</span>
-                </>
-              )}
-              <input
-                ref={fileInputRef}
-                className="visually-hidden"
-                type="file"
-                onChange={(e) => pickFile(e.target.files?.[0] ?? null)}
-              />
-            </div>
-
-            <button type="submit" disabled={uploading || !file} className="primary-btn">
-              {uploading ? (
-                <>
-                  <span className="spinner" /> Uploading...
-                </>
-              ) : (
-                "Upload document"
-              )}
-            </button>
-          </form>
-        </aside>
+              <button type="submit" disabled={uploading || !file} className="primary-btn">
+                {uploading ? (
+                  <>
+                    <span className="spinner" /> Uploading...
+                  </>
+                ) : (
+                  "Upload document"
+                )}
+              </button>
+              <p className="upload-note">Uploaded as {user.name}. Any approver can review it.</p>
+            </form>
+          </aside>
+        )}
 
         <main className="panel documents-panel">
           <div className="documents-header">
             <h2>Documents</h2>
+            <input
+              className="search-input"
+              placeholder="Search by filename..."
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+            />
             <div className="filter-row">
               {filters.map((f) => (
                 <button
@@ -272,20 +308,26 @@ export default function App() {
             </div>
           </div>
 
+          {!showApprove && (
+            <p className="scope-note">
+              Showing your own documents plus every acknowledged document from other consultants.
+            </p>
+          )}
+
           {loading ? (
             <div className="skeleton-grid">
               {[0, 1, 2].map((i) => (
                 <div key={i} className="skeleton-card" />
               ))}
             </div>
-          ) : visibleDocuments.length === 0 ? (
+          ) : documents.length === 0 ? (
             <div className="empty-state">
               <span className="empty-icon">🗂️</span>
-              <p>{documents.length === 0 ? "No documents uploaded yet." : "Nothing in this filter."}</p>
+              <p>{search ? "No documents match your search." : "No documents to show yet."}</p>
             </div>
           ) : (
             <div className="doc-grid">
-              {visibleDocuments.map((doc) => (
+              {documents.map((doc) => (
                 <article key={doc.id} className={`doc-card doc-card-${doc.status.toLowerCase()}`}>
                   <div className="doc-card-top">
                     <span className="doc-file-icon">{fileKindIcon(doc.mime_type)}</span>
@@ -300,31 +342,26 @@ export default function App() {
 
                   <div className="doc-meta-row">
                     <span>
-                      {doc.uploader_name} → {doc.intended_recipient}
+                      Uploaded by <strong>{doc.uploader_name}</strong>
+                      {doc.uploader_id === user.id ? " (you)" : ""}
                     </span>
                     <span className="doc-time">{timeAgo(doc.created_at)}</span>
                   </div>
 
                   {doc.status === "ACKNOWLEDGED" && (
                     <div className="doc-outcome doc-outcome-ack">
-                      Acknowledged by <strong>{doc.acknowledged_by}</strong> - {timeAgo(doc.acknowledged_at!)}
+                      Acknowledged by <strong>{doc.acknowledged_by_name}</strong> - {timeAgo(doc.acknowledged_at!)}
                     </div>
                   )}
                   {doc.status === "REJECTED" && (
                     <div className="doc-outcome doc-outcome-rej">
-                      Rejected by <strong>{doc.rejected_by}</strong> - {timeAgo(doc.rejected_at!)}
+                      Rejected by <strong>{doc.rejected_by_name}</strong> - {timeAgo(doc.rejected_at!)}
                       {doc.rejection_reason ? <div className="doc-reason">"{doc.rejection_reason}"</div> : null}
                     </div>
                   )}
 
-                  {doc.status === "UPLOADED" && (
+                  {doc.status === "UPLOADED" && showApprove && (
                     <div className="doc-actions">
-                      <input
-                        className="doc-actions-input"
-                        placeholder="Your name"
-                        value={actorById[doc.id] || ""}
-                        onChange={(e) => setActorById((s) => ({ ...s, [doc.id]: e.target.value }))}
-                      />
                       <input
                         className="doc-actions-input"
                         placeholder="Rejection reason (optional)"
@@ -348,6 +385,10 @@ export default function App() {
                         </button>
                       </div>
                     </div>
+                  )}
+
+                  {doc.status === "UPLOADED" && !showApprove && (
+                    <div className="doc-outcome doc-outcome-pending">Waiting on an approver</div>
                   )}
                 </article>
               ))}

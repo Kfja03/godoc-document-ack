@@ -549,3 +549,211 @@ input:focus {
     background-position: 0 50%;
   }
 }
+
+/* --- auth / login --- */
+
+.boot-screen {
+  display: grid;
+  place-items: center;
+  height: 100vh;
+}
+
+.spinner-dark {
+  width: 24px;
+  height: 24px;
+  border-width: 3px;
+  border-color: rgba(20, 23, 31, 0.15);
+  border-top-color: var(--accent);
+}
+
+.login-page {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: radial-gradient(circle at top, #f0f1fb 0%, var(--bg) 60%);
+}
+
+.login-card {
+  width: 100%;
+  max-width: 380px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: 32px 28px;
+  box-shadow: var(--shadow-md);
+  text-align: center;
+}
+
+.login-brand-mark {
+  margin: 0 auto 14px;
+}
+
+.login-card h1 {
+  font-size: 1.15rem;
+  margin: 0 0 4px;
+  letter-spacing: -0.01em;
+}
+
+.login-card .subtitle {
+  margin-bottom: 20px;
+}
+
+.login-card .upload-form {
+  text-align: left;
+}
+
+.login-card .primary-btn {
+  width: 100%;
+  margin-top: 4px;
+}
+
+.demo-accounts {
+  margin-top: 22px;
+  padding-top: 18px;
+  border-top: 1px solid var(--border);
+  text-align: left;
+}
+
+.demo-title {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  margin: 0 0 8px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.demo-accounts ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.demo-fill {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 10px;
+  background: #fbfbfd;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  text-align: left;
+  transition: border-color 0.15s, background 0.15s;
+}
+
+.demo-fill:hover {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent-dark);
+}
+
+.demo-fill code {
+  color: var(--text);
+  font-weight: 600;
+  font-size: 0.78rem;
+}
+
+/* --- topbar user block --- */
+
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.user-block {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.user-identity {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 2px;
+}
+
+.user-name {
+  font-size: 0.85rem;
+  font-weight: 600;
+}
+
+.role-tag {
+  font-size: 0.68rem;
+  font-weight: 650;
+  color: var(--accent-dark);
+  background: var(--accent-soft);
+  padding: 2px 8px;
+  border-radius: 999px;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.logout-btn {
+  padding: 7px 14px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text-muted);
+  font-size: 0.8rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.logout-btn:hover {
+  border-color: var(--rej-fg);
+  color: var(--rej-fg);
+}
+
+/* --- single-column layout when upload panel is hidden (approve-only) --- */
+
+.layout-no-upload {
+  grid-template-columns: 1fr;
+}
+
+/* --- search + scope note --- */
+
+.documents-header {
+  align-items: center;
+}
+
+.search-input {
+  flex: 1;
+  min-width: 180px;
+  max-width: 280px;
+}
+
+.scope-note {
+  font-size: 0.8rem;
+  color: var(--text-muted);
+  background: #fbfbfd;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: 8px 12px;
+  margin: 0 0 14px;
+}
+
+.upload-note {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  text-align: center;
+  margin: 0;
+}
+
+.doc-outcome-pending {
+  font-size: 0.78rem;
+  color: var(--text-muted);
+  font-style: italic;
+}
