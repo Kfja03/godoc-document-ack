@@ -4,8 +4,11 @@ import type { CurrentUser, DocumentRecord } from "./api";
 import {
   acknowledgeDocument,
   canApprove,
+  canManage,
   canUpload,
+  deleteDocument,
   downloadUrl,
+  editDocument,
   fetchCurrentUser,
   listDocuments,
   logout,
@@ -50,6 +53,17 @@ function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+// Mirrors the backend default (REJECTED_RETENTION_DAYS in .env, default
+// 30) purely for display - if that env var is changed, this countdown
+// would need to be passed down from the API instead of assumed here.
+const RETENTION_DAYS = 30;
+
+function daysUntilPurge(rejectedAtIso: string): number {
+  const rejectedAt = new Date(rejectedAtIso.replace(" ", "T") + "Z").getTime();
+  const purgeAt = rejectedAt + RETENTION_DAYS * 24 * 60 * 60 * 1000;
+  return Math.ceil((purgeAt - Date.now()) / (24 * 60 * 60 * 1000));
 }
 
 function timeAgo(iso: string): string {
@@ -101,6 +115,7 @@ function Workspace({ user, onLogout }: { user: CurrentUser; onLogout: () => void
 
   const [reasonById, setReasonById] = useState<Record<string, string>>({});
   const [busyId, setBusyId] = useState<string | null>(null);
+  const editInputRefs = useRef<Map<string, HTMLInputElement>>(new Map());
 
   async function refresh() {
     try {
@@ -189,6 +204,38 @@ function Workspace({ user, onLogout }: { user: CurrentUser; onLogout: () => void
     }
   }
 
+  async function handleDelete(doc: DocumentRecord) {
+    if (!window.confirm(`Permanently delete "${doc.original_filename}"? This cannot be undone.`)) {
+      return;
+    }
+    setBusyId(doc.id);
+    setError(null);
+    try {
+      await deleteDocument(doc.id);
+      await refresh();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setBusyId(null);
+    }
+  }
+
+  async function handleEditFileChange(doc: DocumentRecord, newFile: File | undefined) {
+    if (!newFile) return;
+    setBusyId(doc.id);
+    setError(null);
+    try {
+      await editDocument(doc.id, newFile);
+      await refresh();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setBusyId(null);
+      const input = editInputRefs.current.get(doc.id);
+      if (input) input.value = "";
+    }
+  }
+
   async function handleLogout() {
     await logout();
     onLogout();
@@ -203,6 +250,7 @@ function Workspace({ user, onLogout }: { user: CurrentUser; onLogout: () => void
 
   const showUpload = canUpload(user.role);
   const showApprove = canApprove(user.role);
+  const showManage = canManage(user.role);
 
   return (
     <div className="page">
@@ -357,6 +405,13 @@ function Workspace({ user, onLogout }: { user: CurrentUser; onLogout: () => void
                     <div className="doc-outcome doc-outcome-rej">
                       Rejected by <strong>{doc.rejected_by_name}</strong> - {timeAgo(doc.rejected_at!)}
                       {doc.rejection_reason ? <div className="doc-reason">"{doc.rejection_reason}"</div> : null}
+                      <div className="purge-countdown">
+                        {daysUntilPurge(doc.rejected_at!) > 0
+                          ? `Auto-deletes in ${daysUntilPurge(doc.rejected_at!)} day${
+                              daysUntilPurge(doc.rejected_at!) === 1 ? "" : "s"
+                            }`
+                          : "Queued for automatic deletion"}
+                      </div>
                     </div>
                   )}
 
@@ -389,6 +444,35 @@ function Workspace({ user, onLogout }: { user: CurrentUser; onLogout: () => void
 
                   {doc.status === "UPLOADED" && !showApprove && (
                     <div className="doc-outcome doc-outcome-pending">Waiting on an approver</div>
+                  )}
+
+                  {showManage && (
+                    <div className="manage-actions">
+                      <input
+                        ref={(el) => {
+                          if (el) editInputRefs.current.set(doc.id, el);
+                          else editInputRefs.current.delete(doc.id);
+                        }}
+                        className="visually-hidden"
+                        type="file"
+                        onChange={(e) => handleEditFileChange(doc, e.target.files?.[0])}
+                      />
+                      <button
+                        className="manage-btn"
+                        disabled={busyId === doc.id}
+                        onClick={() => editInputRefs.current.get(doc.id)?.click()}
+                        title="Replace the file - resets this document to Awaiting review"
+                      >
+                        ✎ Edit
+                      </button>
+                      <button
+                        className="manage-btn manage-btn-danger"
+                        disabled={busyId === doc.id}
+                        onClick={() => handleDelete(doc)}
+                      >
+                        🗑 Delete
+                      </button>
+                    </div>
                   )}
                 </article>
               ))}

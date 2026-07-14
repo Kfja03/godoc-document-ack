@@ -49,6 +49,10 @@ export function canApprove(role: Role): boolean {
   return role === "APPROVE_ONLY" || role === "UPLOAD_AND_APPROVE";
 }
 
+export function canManage(role: Role): boolean {
+  return role === "UPLOAD_AND_APPROVE";
+}
+
 // --- auth ---
 
 export async function login(email: string, password: string): Promise<CurrentUser> {
@@ -112,6 +116,26 @@ export async function rejectDocument(id: string, reason: string): Promise<Docume
     body: JSON.stringify({ reason }),
   });
   return parseJsonOrThrow<DocumentRecord>(res);
+}
+
+export async function editDocument(id: string, file: File): Promise<DocumentRecord> {
+  const form = new FormData();
+  form.append("file", file);
+  const res = await fetch(`/api/documents/${id}`, {
+    method: "PATCH",
+    credentials: "include",
+    body: form,
+  });
+  return parseJsonOrThrow<DocumentRecord>(res);
+}
+
+export async function deleteDocument(id: string): Promise<void> {
+  const res = await fetch(`/api/documents/${id}`, { method: "DELETE", credentials: "include" });
+  if (!res.ok && res.status !== 204) {
+    const body = await res.json().catch(() => ({}));
+    const err = body as ApiError;
+    throw new Error(err.error || `Request failed (${res.status})`);
+  }
 }
 
 export function downloadUrl(id: string): string {

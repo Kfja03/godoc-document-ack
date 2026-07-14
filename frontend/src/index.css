@@ -757,3 +757,47 @@ input:focus {
   color: var(--text-muted);
   font-style: italic;
 }
+
+/* --- lead manage actions (edit / delete) --- */
+
+.manage-actions {
+  display: flex;
+  gap: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+}
+
+.manage-btn {
+  flex: 1;
+  padding: 7px 10px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text-muted);
+  font-size: 0.78rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.manage-btn:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--accent-dark);
+}
+
+.manage-btn-danger:hover:not(:disabled) {
+  border-color: var(--rej-fg);
+  color: var(--rej-fg);
+}
+
+.manage-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.purge-countdown {
+  margin-top: 4px;
+  font-size: 0.72rem;
+  opacity: 0.75;
+  font-style: normal;
+}

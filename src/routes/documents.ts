@@ -8,11 +8,18 @@ import {
   acknowledgeDocument,
   canUserSeeDocument,
   createDocument,
+  deleteDocumentPermanently,
   getDocumentRow,
   listDocumentsForUser,
   rejectDocument,
+  replaceDocumentFile,
 } from "../lib/documents";
-import { requireAuth, requireApproveCapability, requireUploadCapability } from "../middleware/auth";
+import {
+  requireAuth,
+  requireApproveCapability,
+  requireManageCapability,
+  requireUploadCapability,
+} from "../middleware/auth";
 import type { DocumentStatus } from "../lib/stateMachine";
 
 const uploadDir = process.env.UPLOAD_DIR || "./uploads";
@@ -121,6 +128,56 @@ router.post("/:id/reject", requireApproveCapability, (req: Request, res: Respons
     });
   }
   return res.json(result.document);
+});
+
+// PATCH /api/documents/:id - lead-only: replace the file on an existing
+// document. Resets it to UPLOADED (see replaceDocumentFile for why).
+router.patch(
+  "/:id",
+  requireManageCapability,
+  upload.single("file"),
+  (req: Request, res: Response) => {
+    const file = req.file;
+    if (!file) {
+      return res.status(400).json({ errors: ["No file was provided (field name must be 'file')."] });
+    }
+
+    const validation = validateUpload({
+      mimeType: file.mimetype,
+      sizeBytes: file.size,
+      originalFilename: file.originalname,
+    });
+    if (!validation.valid) {
+      fs.unlink(file.path, () => {});
+      return res.status(400).json({ errors: validation.errors });
+    }
+
+    const result = replaceDocumentFile(req.params.id, {
+      originalFilename: file.originalname,
+      storedFilename: file.filename,
+      mimeType: file.mimetype,
+      sizeBytes: file.size,
+    });
+
+    if (!result.ok) {
+      fs.unlink(file.path, () => {});
+      return res.status(404).json({ error: "Document not found." });
+    }
+
+    // Clean up the file being replaced now that the DB points at the new one.
+    fs.unlink(path.join(uploadDir, result.oldStoredFilename), () => {});
+    return res.json(result.document);
+  }
+);
+
+// DELETE /api/documents/:id - lead-only: permanent delete.
+router.delete("/:id", requireManageCapability, (req: Request, res: Response) => {
+  const result = deleteDocumentPermanently(req.params.id);
+  if (!result.ok) {
+    return res.status(404).json({ error: "Document not found." });
+  }
+  fs.unlink(path.join(uploadDir, result.storedFilename), () => {});
+  return res.status(204).send();
 });
 
 export default router;

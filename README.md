@@ -10,6 +10,7 @@ who uploaded what and who's allowed to approve.
 - [Architecture](#architecture)
 - [Authentication & roles](#authentication--roles)
 - [State machine](#state-machine)
+- [Editing, deletion & retention](#editing-deletion--retention)
 - [Setup & run](#setup--run)
 - [Running with Docker](#running-with-docker)
 - [Running tests](#running-tests)
@@ -51,20 +52,24 @@ src/
   lib/
     validation.ts      Upload validation (mime type allowlist, size limit)
     stateMachine.ts     Pure, declarative transition table for document status
-    roles.ts            canUpload() / canApprove() - the only place role
-                         logic is defined, so it can't drift between routes
+    roles.ts            canUpload() / canApprove() / canManage() - the only
+                         place role logic is defined, so it can't drift
+                         between routes
     users.ts             User creation, lookup, password hashing/verification
     tokens.ts             JWT sign/verify
-    documents.ts           Data access, visibility filtering, transitions
+    documents.ts           Data access, visibility filtering, transitions,
+                            file replacement, permanent delete
+    retention.ts            Finds + purges expired REJECTED documents
   middleware/
     auth.ts             requireAuth, requireUploadCapability,
-                         requireApproveCapability
+                         requireApproveCapability, requireManageCapability
   routes/
     auth.ts              login, logout, me
-    documents.ts           upload, list, get, download, acknowledge, reject
-tests/                 Unit tests (validation, state machine) + integration
-                       tests (full HTTP flow via Supertest, including auth
-                       and role enforcement)
+    documents.ts           upload, list, get, download, acknowledge, reject,
+                            edit (PATCH), delete (DELETE)
+tests/                 Unit tests (validation, state machine, retention) +
+                       integration tests (full HTTP flow via Supertest,
+                       including auth, role enforcement, and manage actions)
 ```
 
 The backend is a single Express process. Role logic lives in exactly one
@@ -79,18 +84,18 @@ not a hunt through every route handler.
 Every user has exactly one role, set at account creation (there's no
 self-signup - see "known limitations"):
 
-| Role | Can upload? | Can acknowledge/reject? | Can see |
-|---|---|---|---|
-| `UPLOAD_ONLY` | Yes | No | Their own documents in any status, **plus** any document from anyone that's been `ACKNOWLEDGED` |
-| `APPROVE_ONLY` | No | Yes | Every document, any status, any uploader |
-| `UPLOAD_AND_APPROVE` | Yes | Yes | Every document, any status, any uploader |
+| Role | Can upload? | Can acknowledge/reject? | Can edit/delete *any* document? | Can see |
+|---|---|---|---|---|
+| `UPLOAD_ONLY` | Yes | No | No | Their own documents in any status, **plus** any document from anyone that's been `ACKNOWLEDGED` |
+| `APPROVE_ONLY` | No | Yes | No | Every document, any status, any uploader |
+| `UPLOAD_AND_APPROVE` ("lead") | Yes | Yes | Yes | Every document, any status, any uploader |
 
 This is enforced in two independent places, deliberately:
 
 1. **Route-level capability checks** (`requireUploadCapability` /
-   `requireApproveCapability` middleware) - a `POST /api/documents` from a
-   user without upload capability never even reaches the upload logic; it
-   gets a `403` immediately.
+   `requireApproveCapability` / `requireManageCapability` middleware) - a
+   `POST /api/documents` from a user without upload capability never even
+   reaches the upload logic; it gets a `403` immediately.
 2. **Row-level visibility filtering** (`listDocumentsForUser`,
    `canUserSeeDocument`) - this is the part that actually answers "upload
    only should only see their own uploaded files, approved or pending,
@@ -100,6 +105,13 @@ This is enforced in two independent places, deliberately:
    guessing a document's UUID doesn't bypass the list-level filtering -
    both return `404`, not `403`, for a document you're not allowed to know
    exists).
+
+**Edit/delete is deliberately narrower than approve.** `canManage()` only
+returns true for `UPLOAD_AND_APPROVE`, not for `APPROVE_ONLY` - an approver
+can accept or reject a document, but correcting someone else's mistake (or
+permanently removing a document) is a bigger action than a review decision,
+so it's scoped to the "lead" role specifically rather than piggybacking on
+approve capability.
 
 Sessions are a JWT stored in an httpOnly cookie (`godoc_session`), issued on
 login and verified on every request via the `requireAuth` middleware. The
@@ -154,6 +166,52 @@ UPLOADED ─────────────► ACKNOWLEDGED   (terminal)
   test that fires two concurrent acknowledge requests from two different
   approvers and asserts exactly one succeeds.
 
+## Editing, deletion & retention
+
+Two lead-only ("`UPLOAD_AND_APPROVE`") actions sit alongside the state
+machine rather than inside it:
+
+- **Edit (`PATCH /api/documents/:id`)** replaces the file on an existing
+  document - upload a new file, keep the same document record. Because the
+  content changed, any prior acknowledge/reject decision is no longer
+  meaningful, so this **resets the document to `UPLOADED`** and clears the
+  acknowledged/rejected fields (`replaceDocumentFile` in
+  `src/lib/documents.ts`). A corrected document goes back into the review
+  queue rather than staying "approved" against a file nobody actually
+  reviewed. The old file is deleted from disk once the DB points at the new
+  one.
+- **Delete (`DELETE /api/documents/:id`)** permanently removes the document
+  row and its file. This is a **hard delete** - there's no trash/undo. See
+  "known limitations" for the audit-trail trade-off that comes with that.
+
+Both require `canManage()` (lead only, not `APPROVE_ONLY`) and both work on
+any document regardless of uploader or status - a lead can fix or remove
+anyone's document, not just their own.
+
+**Retention: rejected documents auto-delete after 30 days.**
+`src/lib/retention.ts` exports `purgeExpiredRejectedDocuments`, a pure
+function (DB query + file cleanup, no HTTP involved) that finds every
+`REJECTED` document whose `rejected_at` is older than the retention window
+and deletes both the row and the file. `src/server.ts` runs it once at
+boot and then every 6 hours via `setInterval`. The window is configurable
+via `REJECTED_RETENTION_DAYS` in `.env` (default 30).
+
+This is a deliberately naive scheduler, not a real job queue - worth being
+upfront about the trade-off: it only runs while this one process is alive,
+doesn't coordinate across multiple instances (each would run its own
+redundant sweep if this were ever scaled horizontally), and a missed window
+because the process was down just means expired documents live a bit
+longer rather than anything breaking. A production version would move this
+to a proper cron trigger or queue worker calling the same
+`purgeExpiredRejectedDocuments` function - it's already decoupled from
+Express specifically so that swap doesn't touch the retention logic itself.
+The frontend shows a "days until auto-delete" hint on rejected document
+cards (`RETENTION_DAYS` in `frontend/src/App.tsx`), computed client-side
+from `rejected_at` - it assumes the default 30-day window rather than
+reading it from the API, so it'd need to be passed down from `GET
+/api/documents` if the retention window is ever made per-deployment
+configurable in a way the frontend needs to reflect exactly.
+
 ## Setup & run
 
 **Requirements:** Node.js 22.5+ (uses the built-in `node:sqlite` module).
@@ -163,72 +221,3 @@ UPLOADED ─────────────► ACKNOWLEDGED   (terminal)
 npm install
 npm run build
 npm run seed         # creates the demo accounts (optional - the server
-                      # auto-seeds on first boot if the users table is empty)
-npm start             # http://localhost:4000
-
-# 2. Frontend (separate terminal)
-cd frontend
-npm install
-npm run dev            # http://localhost:5173, proxies /api to :4000
-```
-
-For local iteration, `npm run dev` in the project root runs the backend
-with hot reload (`ts-node-dev`) instead of `npm run build && npm start`.
-
-The SQLite schema is created automatically on first run (idempotent
-`CREATE TABLE IF NOT EXISTS`, see `src/db/index.ts`).
-
-Uploaded files are written to `./uploads` (configurable via `UPLOAD_DIR` in
-`.env`).
-
-## Running with Docker
-
-```bash
-docker compose up --build
-```
-
-- Backend: http://localhost:4000 - auto-seeds the demo accounts above on
-  first boot, no extra step needed. SQLite + uploads persist in named
-  volumes (`backend_data` / `backend_uploads`) across restarts/rebuilds -
-  use `docker compose down -v` to wipe them and start fresh.
-- Frontend: http://localhost:8080 - nginx serves the built static app and
-  proxies `/api/*` to the backend container (see `frontend/nginx.conf`),
-  so the session cookie stays same-origin from the browser's perspective.
-
-Each service has its own multi-stage Dockerfile: a build stage compiles
-TypeScript / runs the Vite build, and the runtime stage only ships the
-compiled output plus production dependencies.
-
-## Running tests
-
-```bash
-npm test
-```
-
-24 tests: unit tests for validation rules and the state machine transition
-table, plus integration tests covering auth (login success/failure, `/me`,
-logout), capability enforcement (upload-only blocked from
-acknowledging/rejecting with `403`, approve-only blocked from uploading),
-document visibility per role (including that a hidden document 404s even
-when fetched directly by ID, not just filtered out of the list), search and
-status filtering, the full upload → acknowledge/reject lifecycle, and the
-concurrent-acknowledge race test. Each test file gets its own throwaway
-SQLite file and upload directory (`tests/setupEnv.ts`), and every test
-within `documents.integration.test.ts` clears the `documents`/`users`
-tables in `beforeEach` so tests can assert exact visible-document lists
-without leaking state between cases.
-
-## API overview
-
-| Method | Route | Auth | Description |
-|---|---|---|---|
-| GET | `/api/health` | none | Liveness check |
-| POST | `/api/auth/login` | none | Body: `{ email, password }`. Sets the session cookie, returns `{ user }`. `401` on bad credentials. |
-| POST | `/api/auth/logout` | session | Clears the session cookie |
-| GET | `/api/auth/me` | session | Returns `{ user }` for the current session, `401` if not logged in |
-| POST | `/api/documents` | session + upload capability | `multipart/form-data`: `file`. Uploader is taken from the session, not the request body. `403` without upload capability, `400` on invalid file. |
-| GET | `/api/documents?status=&search=` | session | Documents visible to the caller (see visibility rules above); optional status filter and filename search, both applied server-side |
-| GET | `/api/documents/:id` | session | `404` if the document doesn't exist *or* isn't visible to the caller - the two are indistinguishable on purpose |
-| GET | `/api/documents/:id/download` | session | Same visibility check as above |
-| POST | `/api/documents/:id/acknowledge` | session + approve capability | `200` + updated document, `409` if not currently `UPLOADED`, `403` without approve capability |
-| POST | `/api/documents/:id/

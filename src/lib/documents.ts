@@ -166,3 +166,71 @@ export function acknowledgeDocument(id: string, actorId: string): TransitionResu
 export function rejectDocument(id: string, actorId: string, reason?: string): TransitionResult {
   return applyTransition(id, "REJECT", actorId, reason);
 }
+
+export interface ReplaceFileInput {
+  originalFilename: string;
+  storedFilename: string;
+  mimeType: string;
+  sizeBytes: number;
+}
+
+export type ReplaceFileResult =
+  | { ok: true; document: DocumentRow; oldStoredFilename: string }
+  | { ok: false; reason: "NOT_FOUND" };
+
+/**
+ * Lead-only "edit": swap the underlying file on an existing document
+ * record. Because the content changed, any prior acknowledge/reject
+ * decision is no longer meaningful, so this resets the document back to
+ * UPLOADED and clears acknowledged/rejected fields - it goes back into the
+ * review queue rather than staying "approved" against a file nobody
+ * actually reviewed. The caller is responsible for deleting
+ * `oldStoredFilename` from disk (this module only touches the DB, same
+ * convention as the rest of this file).
+ */
+export function replaceDocumentFile(id: string, input: ReplaceFileInput): ReplaceFileResult {
+  const existing = getDocumentRow(id);
+  if (!existing) return { ok: false, reason: "NOT_FOUND" };
+
+  db.prepare(
+    `UPDATE documents
+     SET original_filename = ?, stored_filename = ?, mime_type = ?, size_bytes = ?,
+         status = 'UPLOADED',
+         acknowledged_at = NULL, acknowledged_by_id = NULL,
+         rejected_at = NULL, rejected_by_id = NULL, rejection_reason = NULL
+     WHERE id = ?`
+  ).run(input.originalFilename, input.storedFilename, input.mimeType, input.sizeBytes, id);
+
+  return { ok: true, document: getDocumentRow(id)!, oldStoredFilename: existing.stored_filename };
+}
+
+export type DeleteResult =
+  | { ok: true; storedFilename: string }
+  | { ok: false; reason: "NOT_FOUND" };
+
+/**
+ * Lead-only permanent delete. This is a hard delete, not a soft/archive -
+ * see README "Known limitations" for the audit-trail trade-off that comes
+ * with that for a consultation-document product.
+ */
+export function deleteDocumentPermanently(id: string): DeleteResult {
+  const existing = getDocumentRow(id);
+  if (!existing) return { ok: false, reason: "NOT_FOUND" };
+  db.prepare(`DELETE FROM documents WHERE id = ?`).run(id);
+  return { ok: true, storedFilename: existing.stored_filename };
+}
+
+/**
+ * Documents that have been REJECTED for longer than `retentionDays`.
+ * Pure query, no side effects - the caller (a scheduled job or a test)
+ * decides what to do with the result, including deleting the files from
+ * disk and the rows from the DB.
+ */
+export function findExpiredRejectedDocuments(retentionDays: number, now: Date = new Date()): DocumentRow[] {
+  const cutoff = new Date(now.getTime() - retentionDays * 24 * 60 * 60 * 1000);
+  const cutoffIso = cutoff.toISOString().slice(0, 19).replace("T", " ");
+  return db
+    .prepare(`${SELECT_DOCUMENT} WHERE d.status = 'REJECTED' AND d.rejected_at <= ? ORDER BY d.rejected_at ASC`)
+    .all(cutoffIso) as unknown as DocumentRow[];
+}
+

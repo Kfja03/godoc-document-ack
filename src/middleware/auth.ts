@@ -1,7 +1,7 @@
 import { Request, Response, NextFunction } from "express";
 import { verifyToken } from "../lib/tokens";
 import { getUserById, type UserRecord } from "../lib/users";
-import { canApprove, canUpload } from "../lib/roles";
+import { canApprove, canManage, canUpload } from "../lib/roles";
 
 export const AUTH_COOKIE = "godoc_session";
 
@@ -38,6 +38,13 @@ export function requireUploadCapability(req: Request, res: Response, next: NextF
 export function requireApproveCapability(req: Request, res: Response, next: NextFunction) {
   if (!req.user || !canApprove(req.user.role)) {
     return res.status(403).json({ error: "Your role does not have approval permission." });
+  }
+  next();
+}
+
+export function requireManageCapability(req: Request, res: Response, next: NextFunction) {
+  if (!req.user || !canManage(req.user.role)) {
+    return res.status(403).json({ error: "Only a lead consultant can edit or delete another document." });
   }
   next();
 }
