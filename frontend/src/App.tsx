@@ -119,6 +119,8 @@ export default function App() {
     try {
       await uploadDocument(file, uploaderName, intendedRecipient);
       pickFile(null);
+      setUploaderName("");
+      setIntendedRecipient("");
       if (fileInputRef.current) fileInputRef.current.value = "";
       await refresh();
     } catch (e) {
