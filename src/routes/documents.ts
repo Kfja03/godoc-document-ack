@@ -8,11 +8,13 @@ import {
   acknowledgeDocument,
   canUserSeeDocument,
   createDocument,
-  deleteDocumentPermanently,
-  getDocumentRow,
+  getActiveDocumentRow,
   listDocumentsForUser,
   rejectDocument,
   replaceDocumentFile,
+  requestRevisionDocument,
+  resubmitDocument,
+  softDeleteDocument,
 } from "../lib/documents";
 import {
   requireAuth,
@@ -20,6 +22,7 @@ import {
   requireManageCapability,
   requireUploadCapability,
 } from "../middleware/auth";
+import { canManage } from "../lib/roles";
 import type { DocumentStatus } from "../lib/stateMachine";
 
 const uploadDir = process.env.UPLOAD_DIR || "./uploads";
@@ -41,7 +44,7 @@ const upload = multer({
 const router = Router();
 router.use(requireAuth);
 
-const VALID_STATUSES: DocumentStatus[] = ["UPLOADED", "ACKNOWLEDGED", "REJECTED"];
+const VALID_STATUSES: DocumentStatus[] = ["UPLOADED", "ACKNOWLEDGED", "REJECTED", "NEEDS_REVISION"];
 
 // POST /api/documents - upload a document (requires upload capability)
 router.post("/", requireUploadCapability, upload.single("file"), (req: Request, res: Response) => {
@@ -88,7 +91,7 @@ router.get("/", (req: Request, res: Response) => {
 
 // GET /api/documents/:id
 router.get("/:id", (req: Request, res: Response) => {
-  const doc = getDocumentRow(req.params.id);
+  const doc = getActiveDocumentRow(req.params.id);
   if (!doc || !canUserSeeDocument(req.user!, doc)) {
     return res.status(404).json({ error: "Document not found." });
   }
@@ -97,7 +100,7 @@ router.get("/:id", (req: Request, res: Response) => {
 
 // GET /api/documents/:id/download
 router.get("/:id/download", (req: Request, res: Response) => {
-  const doc = getDocumentRow(req.params.id);
+  const doc = getActiveDocumentRow(req.params.id);
   if (!doc || !canUserSeeDocument(req.user!, doc)) {
     return res.status(404).json({ error: "Document not found." });
   }
@@ -129,6 +132,72 @@ router.post("/:id/reject", requireApproveCapability, (req: Request, res: Respons
   }
   return res.json(result.document);
 });
+
+// POST /api/documents/:id/request-revision (requires approval capability)
+// "This is broadly right but needs a fix / more info" - distinct from an
+// outright reject. Puts the document in NEEDS_REVISION, which only the
+// document's own uploader (or a lead) can resolve via /resubmit.
+router.post("/:id/request-revision", requireApproveCapability, (req: Request, res: Response) => {
+  const { note } = req.body || {};
+  const result = requestRevisionDocument(req.params.id, req.user!.id, note);
+  if (!result.ok) {
+    if (result.reason === "NOT_FOUND") return res.status(404).json({ error: "Document not found." });
+    return res.status(409).json({
+      error: `Document cannot have revision requested from its current status: ${result.currentStatus}`,
+    });
+  }
+  return res.json(result.document);
+});
+
+// POST /api/documents/:id/resubmit (requires upload capability) - the
+// uploader's response to a request-revision: a corrected file that sends
+// the document back to UPLOADED. Scoped to the document's own uploader, or
+// a lead acting on their behalf (same canManage() used for edit/delete).
+router.post(
+  "/:id/resubmit",
+  requireUploadCapability,
+  upload.single("file"),
+  (req: Request, res: Response) => {
+    const file = req.file;
+    if (!file) {
+      return res.status(400).json({ errors: ["No file was provided (field name must be 'file')."] });
+    }
+
+    const validation = validateUpload({
+      mimeType: file.mimetype,
+      sizeBytes: file.size,
+      originalFilename: file.originalname,
+    });
+    if (!validation.valid) {
+      fs.unlink(file.path, () => {});
+      return res.status(400).json({ errors: validation.errors });
+    }
+
+    const result = resubmitDocument(
+      req.params.id,
+      { id: req.user!.id, canManage: canManage(req.user!.role) },
+      {
+        originalFilename: file.originalname,
+        storedFilename: file.filename,
+        mimeType: file.mimetype,
+        sizeBytes: file.size,
+      }
+    );
+
+    if (!result.ok) {
+      fs.unlink(file.path, () => {});
+      if (result.reason === "NOT_FOUND") return res.status(404).json({ error: "Document not found." });
+      if (result.reason === "FORBIDDEN") {
+        return res.status(403).json({ error: "Only the original uploader (or a lead) can resubmit this document." });
+      }
+      return res.status(409).json({
+        error: `Document cannot be resubmitted from its current status: ${result.currentStatus}`,
+      });
+    }
+
+    return res.json(result.document);
+  }
+);
 
 // PATCH /api/documents/:id - lead-only: replace the file on an existing
 // document. Resets it to UPLOADED (see replaceDocumentFile for why).
@@ -170,13 +239,14 @@ router.patch(
   }
 );
 
-// DELETE /api/documents/:id - lead-only: permanent delete.
+// DELETE /api/documents/:id - lead-only: soft delete. Hides the document
+// immediately; the row and file are permanently removed later by the
+// retention sweep (see src/lib/retention.ts).
 router.delete("/:id", requireManageCapability, (req: Request, res: Response) => {
-  const result = deleteDocumentPermanently(req.params.id);
+  const result = softDeleteDocument(req.params.id);
   if (!result.ok) {
     return res.status(404).json({ error: "Document not found." });
   }
-  fs.unlink(path.join(uploadDir, result.storedFilename), () => {});
   return res.status(204).send();
 });
 

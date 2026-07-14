@@ -58,6 +58,40 @@ describe("manage capability (edit + delete)", () => {
     expect(get.status).toBe(404);
   });
 
+  it("delete is a soft delete: the row and file survive, just hidden from every read path", async () => {
+    const uploader = await loginAs(app, "UPLOAD_ONLY");
+    const lead = await loginAs(app, "UPLOAD_AND_APPROVE");
+    const doc = await upload(uploader.agent, "soft-me.pdf");
+
+    await lead.agent.delete(`/api/documents/${doc.id}`);
+
+    // Hidden from list for every role, not just the uploader.
+    const uploaderList = await uploader.agent.get("/api/documents");
+    expect(uploaderList.body.map((d: { id: string }) => d.id)).not.toContain(doc.id);
+    const leadList = await lead.agent.get("/api/documents");
+    expect(leadList.body.map((d: { id: string }) => d.id)).not.toContain(doc.id);
+
+    // But the row (with deleted_at set) and the file are both still there
+    // at the DB/disk level - only the retention sweep removes them for
+    // real. Checked via the internal helper, not the API (which correctly
+    // treats it as gone).
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { getDocumentRow } = require("../src/lib/documents");
+    const raw = getDocumentRow(doc.id);
+    expect(raw).toBeDefined();
+    expect(raw.deleted_at).not.toBeNull();
+  });
+
+  it("deleting an already soft-deleted document returns 404 (can't double-delete)", async () => {
+    const uploader = await loginAs(app, "UPLOAD_ONLY");
+    const lead = await loginAs(app, "UPLOAD_AND_APPROVE");
+    const doc = await upload(uploader.agent);
+    await lead.agent.delete(`/api/documents/${doc.id}`);
+
+    const res = await lead.agent.delete(`/api/documents/${doc.id}`);
+    expect(res.status).toBe(404);
+  });
+
   it("deleting a document that doesn't exist returns 404", async () => {
     const lead = await loginAs(app, "UPLOAD_AND_APPROVE");
     const res = await lead.agent.delete(`/api/documents/does-not-exist`);

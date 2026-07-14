@@ -1,15 +1,26 @@
-export type DocumentStatus = "UPLOADED" | "ACKNOWLEDGED" | "REJECTED";
+export type DocumentStatus = "UPLOADED" | "ACKNOWLEDGED" | "REJECTED" | "NEEDS_REVISION";
 
-export type DocumentEvent = "ACKNOWLEDGE" | "REJECT";
+export type DocumentEvent = "ACKNOWLEDGE" | "REJECT" | "REQUEST_REVISION" | "RESUBMIT";
 
-// UPLOADED is the only non-terminal state. From it, the second party can
-// either acknowledge (happy path) or reject (documented edge case) the
-// document. Both ACKNOWLEDGED and REJECTED are terminal - once a party has
-// acted, the decision cannot be silently overwritten by a later request.
+// UPLOADED is where every document starts and the only state an approver
+// acts on directly. From it, an approver can:
+//   - ACKNOWLEDGE it (happy path, terminal)
+//   - REJECT it outright (terminal - wrong/invalid document, no path back)
+//   - REQUEST_REVISION (the document is broadly right but needs a fix or
+//     more information - not a flat rejection)
+// NEEDS_REVISION is the one non-terminal, non-UPLOADED state: the uploader
+// (or a lead, on anyone's behalf) can RESUBMIT a corrected file, which
+// moves it back to UPLOADED for a fresh review. ACKNOWLEDGED and REJECTED
+// are both terminal - once a decision is made, it isn't silently
+// overwritten by a later request.
 const TRANSITIONS: Record<DocumentStatus, Partial<Record<DocumentEvent, DocumentStatus>>> = {
   UPLOADED: {
     ACKNOWLEDGE: "ACKNOWLEDGED",
     REJECT: "REJECTED",
+    REQUEST_REVISION: "NEEDS_REVISION",
+  },
+  NEEDS_REVISION: {
+    RESUBMIT: "UPLOADED",
   },
   ACKNOWLEDGED: {},
   REJECTED: {},

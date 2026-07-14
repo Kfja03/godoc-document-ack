@@ -8,6 +8,8 @@ export interface CurrentUser {
   created_at: string;
 }
 
+export type DocumentStatus = "UPLOADED" | "ACKNOWLEDGED" | "REJECTED" | "NEEDS_REVISION";
+
 export interface DocumentRecord {
   id: string;
   original_filename: string;
@@ -15,7 +17,7 @@ export interface DocumentRecord {
   size_bytes: number;
   uploader_id: string;
   uploader_name: string;
-  status: "UPLOADED" | "ACKNOWLEDGED" | "REJECTED";
+  status: DocumentStatus;
   created_at: string;
   acknowledged_at: string | null;
   acknowledged_by_id: string | null;
@@ -24,6 +26,10 @@ export interface DocumentRecord {
   rejected_by_id: string | null;
   rejected_by_name: string | null;
   rejection_reason: string | null;
+  revision_requested_at: string | null;
+  revision_requested_by_id: string | null;
+  revision_requested_by_name: string | null;
+  revision_note: string | null;
 }
 
 export interface ApiError {
@@ -118,6 +124,32 @@ export async function rejectDocument(id: string, reason: string): Promise<Docume
   return parseJsonOrThrow<DocumentRecord>(res);
 }
 
+// "Send back for more info" - distinct from reject. Puts the document in
+// NEEDS_REVISION; only the uploader (or a lead) can resolve it, via
+// resubmitDocument below.
+export async function requestRevisionDocument(id: string, note: string): Promise<DocumentRecord> {
+  const res = await fetch(`/api/documents/${id}/request-revision`, {
+    method: "POST",
+    credentials: "include",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ note }),
+  });
+  return parseJsonOrThrow<DocumentRecord>(res);
+}
+
+// The uploader's response to a request-revision: a corrected file that
+// sends the document back to UPLOADED for a fresh review.
+export async function resubmitDocument(id: string, file: File): Promise<DocumentRecord> {
+  const form = new FormData();
+  form.append("file", file);
+  const res = await fetch(`/api/documents/${id}/resubmit`, {
+    method: "POST",
+    credentials: "include",
+    body: form,
+  });
+  return parseJsonOrThrow<DocumentRecord>(res);
+}
+
 export async function editDocument(id: string, file: File): Promise<DocumentRecord> {
   const form = new FormData();
   form.append("file", file);
@@ -129,6 +161,8 @@ export async function editDocument(id: string, file: File): Promise<DocumentReco
   return parseJsonOrThrow<DocumentRecord>(res);
 }
 
+// Soft delete - hides the document immediately; the row/file are removed
+// for real later by the server's retention sweep (see README).
 export async function deleteDocument(id: string): Promise<void> {
   const res = await fetch(`/api/documents/${id}`, { method: "DELETE", credentials: "include" });
   if (!res.ok && res.status !== 204) {

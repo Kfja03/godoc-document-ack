@@ -3,7 +3,8 @@ import path from "path";
 import db from "../src/db";
 import { createUser } from "../src/lib/users";
 import { createDocument, rejectDocument, getDocumentRow } from "../src/lib/documents";
-import { purgeExpiredRejectedDocuments } from "../src/lib/retention";
+import { purgeExpiredRejectedDocuments, purgeExpiredSoftDeletedDocuments } from "../src/lib/retention";
+import { softDeleteDocument } from "../src/lib/documents";
 
 const uploadDir = process.env.UPLOAD_DIR!;
 
@@ -94,5 +95,72 @@ describe("purgeExpiredRejectedDocuments", () => {
 
     expect(() => purgeExpiredRejectedDocuments(uploadDir, 30)).not.toThrow();
     expect(getDocumentRow(oldId)).toBeUndefined();
+  });
+});
+
+function makeSoftDeletedDoc(filename: string, daysAgo: number) {
+  const uploader = createUser({
+    name: "Uploader",
+    email: `uploader-${filename}-${Date.now()}@example.com`,
+    password: "password123",
+    role: "UPLOAD_ONLY",
+  });
+
+  fs.writeFileSync(path.join(uploadDir, filename), "content");
+  const doc = createDocument({
+    originalFilename: filename,
+    storedFilename: filename,
+    mimeType: "application/pdf",
+    sizeBytes: 7,
+    uploaderId: uploader.id,
+  });
+  softDeleteDocument(doc.id);
+  db.prepare(`UPDATE documents SET deleted_at = datetime('now', ?) WHERE id = ?`).run(`-${daysAgo} days`, doc.id);
+  return doc.id;
+}
+
+describe("purgeExpiredSoftDeletedDocuments", () => {
+  it("hard-purges a document soft-deleted more than the retention window ago", () => {
+    const oldId = makeSoftDeletedDoc("old-deleted.pdf", 400);
+
+    const purged = purgeExpiredSoftDeletedDocuments(uploadDir, 365);
+
+    expect(purged.map((d) => d.id)).toEqual([oldId]);
+    expect(getDocumentRow(oldId)).toBeUndefined();
+    expect(fs.existsSync(path.join(uploadDir, "old-deleted.pdf"))).toBe(false);
+  });
+
+  it("leaves a document soft-deleted within the retention window alone", () => {
+    const recentId = makeSoftDeletedDoc("recent-deleted.pdf", 10);
+
+    const purged = purgeExpiredSoftDeletedDocuments(uploadDir, 365);
+
+    expect(purged).toHaveLength(0);
+    const raw = getDocumentRow(recentId);
+    expect(raw).toBeDefined();
+    expect(raw!.deleted_at).not.toBeNull();
+    expect(fs.existsSync(path.join(uploadDir, "recent-deleted.pdf"))).toBe(true);
+  });
+
+  it("never touches a document that hasn't been deleted, regardless of age", () => {
+    const uploader = createUser({
+      name: "Uploader",
+      email: `uploader-untouched-${Date.now()}@example.com`,
+      password: "password123",
+      role: "UPLOAD_ONLY",
+    });
+    const doc = createDocument({
+      originalFilename: "still-here.pdf",
+      storedFilename: "still-here.pdf",
+      mimeType: "application/pdf",
+      sizeBytes: 7,
+      uploaderId: uploader.id,
+    });
+    db.prepare(`UPDATE documents SET created_at = datetime('now', '-999 days') WHERE id = ?`).run(doc.id);
+
+    const purged = purgeExpiredSoftDeletedDocuments(uploadDir, 365);
+
+    expect(purged).toHaveLength(0);
+    expect(getDocumentRow(doc.id)).toBeDefined();
   });
 });

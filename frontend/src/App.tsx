@@ -13,11 +13,13 @@ import {
   listDocuments,
   logout,
   rejectDocument,
+  requestRevisionDocument,
+  resubmitDocument,
   uploadDocument,
 } from "./api";
 import Login from "./Login";
 
-type Filter = "ALL" | "UPLOADED" | "ACKNOWLEDGED" | "REJECTED";
+type Filter = "ALL" | "UPLOADED" | "NEEDS_REVISION" | "ACKNOWLEDGED" | "REJECTED";
 
 function StatusBadge({ status }: { status: DocumentRecord["status"] }) {
   const className =
@@ -25,9 +27,17 @@ function StatusBadge({ status }: { status: DocumentRecord["status"] }) {
       ? "badge badge-ack"
       : status === "REJECTED"
       ? "badge badge-rej"
+      : status === "NEEDS_REVISION"
+      ? "badge badge-rev"
       : "badge badge-pending";
   const label =
-    status === "ACKNOWLEDGED" ? "Acknowledged" : status === "REJECTED" ? "Rejected" : "Awaiting review";
+    status === "ACKNOWLEDGED"
+      ? "Acknowledged"
+      : status === "REJECTED"
+      ? "Rejected"
+      : status === "NEEDS_REVISION"
+      ? "Needs revision"
+      : "Awaiting review";
   return (
     <span className={className}>
       <span className="badge-dot" />
@@ -55,14 +65,15 @@ function formatBytes(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-// Mirrors the backend default (REJECTED_RETENTION_DAYS in .env, default
-// 30) purely for display - if that env var is changed, this countdown
-// would need to be passed down from the API instead of assumed here.
-const RETENTION_DAYS = 30;
+// Mirrors backend defaults (.env) purely for display - if those env vars
+// are changed, these would need to be passed down from the API instead of
+// assumed here. See README "Editing, deletion & retention".
+const REJECTED_RETENTION_DAYS = 30;
+const DELETED_RETENTION_DAYS = 365;
 
-function daysUntilPurge(rejectedAtIso: string): number {
-  const rejectedAt = new Date(rejectedAtIso.replace(" ", "T") + "Z").getTime();
-  const purgeAt = rejectedAt + RETENTION_DAYS * 24 * 60 * 60 * 1000;
+function daysUntilPurge(fromIso: string, retentionDays: number): number {
+  const from = new Date(fromIso.replace(" ", "T") + "Z").getTime();
+  const purgeAt = from + retentionDays * 24 * 60 * 60 * 1000;
   return Math.ceil((purgeAt - Date.now()) / (24 * 60 * 60 * 1000));
 }
 
@@ -113,9 +124,10 @@ function Workspace({ user, onLogout }: { user: CurrentUser; onLogout: () => void
   const [uploading, setUploading] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  const [reasonById, setReasonById] = useState<Record<string, string>>({});
+  const [noteById, setNoteById] = useState<Record<string, string>>({});
   const [busyId, setBusyId] = useState<string | null>(null);
   const editInputRefs = useRef<Map<string, HTMLInputElement>>(new Map());
+  const resubmitInputRefs = useRef<Map<string, HTMLInputElement>>(new Map());
 
   async function refresh() {
     try {
@@ -144,6 +156,7 @@ function Workspace({ user, onLogout }: { user: CurrentUser; onLogout: () => void
     return {
       ALL: documents.length,
       UPLOADED: documents.filter((d) => d.status === "UPLOADED").length,
+      NEEDS_REVISION: documents.filter((d) => d.status === "NEEDS_REVISION").length,
       ACKNOWLEDGED: documents.filter((d) => d.status === "ACKNOWLEDGED").length,
       REJECTED: documents.filter((d) => d.status === "REJECTED").length,
     };
@@ -195,7 +208,20 @@ function Workspace({ user, onLogout }: { user: CurrentUser; onLogout: () => void
     setBusyId(doc.id);
     setError(null);
     try {
-      await rejectDocument(doc.id, reasonById[doc.id] || "");
+      await rejectDocument(doc.id, noteById[doc.id] || "");
+      await refresh();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setBusyId(null);
+    }
+  }
+
+  async function handleRequestRevision(doc: DocumentRecord) {
+    setBusyId(doc.id);
+    setError(null);
+    try {
+      await requestRevisionDocument(doc.id, noteById[doc.id] || "");
       await refresh();
     } catch (e) {
       setError((e as Error).message);
@@ -205,7 +231,11 @@ function Workspace({ user, onLogout }: { user: CurrentUser; onLogout: () => void
   }
 
   async function handleDelete(doc: DocumentRecord) {
-    if (!window.confirm(`Permanently delete "${doc.original_filename}"? This cannot be undone.`)) {
+    if (
+      !window.confirm(
+        `Delete "${doc.original_filename}"? It disappears immediately for everyone; the file itself is kept for ${DELETED_RETENTION_DAYS} days before it's permanently removed.`
+      )
+    ) {
       return;
     }
     setBusyId(doc.id);
@@ -236,6 +266,22 @@ function Workspace({ user, onLogout }: { user: CurrentUser; onLogout: () => void
     }
   }
 
+  async function handleResubmitFileChange(doc: DocumentRecord, newFile: File | undefined) {
+    if (!newFile) return;
+    setBusyId(doc.id);
+    setError(null);
+    try {
+      await resubmitDocument(doc.id, newFile);
+      await refresh();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setBusyId(null);
+      const input = resubmitInputRefs.current.get(doc.id);
+      if (input) input.value = "";
+    }
+  }
+
   async function handleLogout() {
     await logout();
     onLogout();
@@ -244,6 +290,7 @@ function Workspace({ user, onLogout }: { user: CurrentUser; onLogout: () => void
   const filters: { key: Filter; label: string }[] = [
     { key: "ALL", label: "All" },
     { key: "UPLOADED", label: "Awaiting review" },
+    { key: "NEEDS_REVISION", label: "Needs revision" },
     { key: "ACKNOWLEDGED", label: "Acknowledged" },
     { key: "REJECTED", label: "Rejected" },
   ];
@@ -375,107 +422,150 @@ function Workspace({ user, onLogout }: { user: CurrentUser; onLogout: () => void
             </div>
           ) : (
             <div className="doc-grid">
-              {documents.map((doc) => (
-                <article key={doc.id} className={`doc-card doc-card-${doc.status.toLowerCase()}`}>
-                  <div className="doc-card-top">
-                    <span className="doc-file-icon">{fileKindIcon(doc.mime_type)}</span>
-                    <div className="doc-title-block">
-                      <a href={downloadUrl(doc.id)} className="doc-name">
-                        {doc.original_filename}
-                      </a>
-                      <span className="doc-size">{formatBytes(doc.size_bytes)}</span>
-                    </div>
-                    <StatusBadge status={doc.status} />
-                  </div>
-
-                  <div className="doc-meta-row">
-                    <span>
-                      Uploaded by <strong>{doc.uploader_name}</strong>
-                      {doc.uploader_id === user.id ? " (you)" : ""}
-                    </span>
-                    <span className="doc-time">{timeAgo(doc.created_at)}</span>
-                  </div>
-
-                  {doc.status === "ACKNOWLEDGED" && (
-                    <div className="doc-outcome doc-outcome-ack">
-                      Acknowledged by <strong>{doc.acknowledged_by_name}</strong> - {timeAgo(doc.acknowledged_at!)}
-                    </div>
-                  )}
-                  {doc.status === "REJECTED" && (
-                    <div className="doc-outcome doc-outcome-rej">
-                      Rejected by <strong>{doc.rejected_by_name}</strong> - {timeAgo(doc.rejected_at!)}
-                      {doc.rejection_reason ? <div className="doc-reason">"{doc.rejection_reason}"</div> : null}
-                      <div className="purge-countdown">
-                        {daysUntilPurge(doc.rejected_at!) > 0
-                          ? `Auto-deletes in ${daysUntilPurge(doc.rejected_at!)} day${
-                              daysUntilPurge(doc.rejected_at!) === 1 ? "" : "s"
-                            }`
-                          : "Queued for automatic deletion"}
+              {documents.map((doc) => {
+                const canResubmit = doc.status === "NEEDS_REVISION" && (doc.uploader_id === user.id || showManage);
+                return (
+                  <article key={doc.id} className={`doc-card doc-card-${doc.status.toLowerCase()}`}>
+                    <div className="doc-card-top">
+                      <span className="doc-file-icon">{fileKindIcon(doc.mime_type)}</span>
+                      <div className="doc-title-block">
+                        <a href={downloadUrl(doc.id)} className="doc-name">
+                          {doc.original_filename}
+                        </a>
+                        <span className="doc-size">{formatBytes(doc.size_bytes)}</span>
                       </div>
+                      <StatusBadge status={doc.status} />
                     </div>
-                  )}
 
-                  {doc.status === "UPLOADED" && showApprove && (
-                    <div className="doc-actions">
-                      <input
-                        className="doc-actions-input"
-                        placeholder="Rejection reason (optional)"
-                        value={reasonById[doc.id] || ""}
-                        onChange={(e) => setReasonById((s) => ({ ...s, [doc.id]: e.target.value }))}
-                      />
-                      <div className="doc-actions-buttons">
+                    <div className="doc-meta-row">
+                      <span>
+                        Uploaded by <strong>{doc.uploader_name}</strong>
+                        {doc.uploader_id === user.id ? " (you)" : ""}
+                      </span>
+                      <span className="doc-time">{timeAgo(doc.created_at)}</span>
+                    </div>
+
+                    {doc.status === "ACKNOWLEDGED" && (
+                      <div className="doc-outcome doc-outcome-ack">
+                        Acknowledged by <strong>{doc.acknowledged_by_name}</strong> - {timeAgo(doc.acknowledged_at!)}
+                      </div>
+                    )}
+                    {doc.status === "REJECTED" && (
+                      <div className="doc-outcome doc-outcome-rej">
+                        Rejected by <strong>{doc.rejected_by_name}</strong> - {timeAgo(doc.rejected_at!)}
+                        {doc.rejection_reason ? <div className="doc-reason">"{doc.rejection_reason}"</div> : null}
+                        <div className="purge-countdown">
+                          {daysUntilPurge(doc.rejected_at!, REJECTED_RETENTION_DAYS) > 0
+                            ? `Auto-deletes in ${daysUntilPurge(doc.rejected_at!, REJECTED_RETENTION_DAYS)} day${
+                                daysUntilPurge(doc.rejected_at!, REJECTED_RETENTION_DAYS) === 1 ? "" : "s"
+                              }`
+                            : "Queued for automatic deletion"}
+                        </div>
+                      </div>
+                    )}
+                    {doc.status === "NEEDS_REVISION" && (
+                      <div className="doc-outcome doc-outcome-rev">
+                        Revision requested by <strong>{doc.revision_requested_by_name}</strong> -{" "}
+                        {timeAgo(doc.revision_requested_at!)}
+                        {doc.revision_note ? <div className="doc-reason">"{doc.revision_note}"</div> : null}
+                      </div>
+                    )}
+
+                    {doc.status === "UPLOADED" && showApprove && (
+                      <div className="doc-actions">
+                        <input
+                          className="doc-actions-input"
+                          placeholder="Note (used for reject or request revision, optional)"
+                          value={noteById[doc.id] || ""}
+                          onChange={(e) => setNoteById((s) => ({ ...s, [doc.id]: e.target.value }))}
+                        />
+                        <div className="doc-actions-buttons">
+                          <button
+                            className="ack-btn"
+                            disabled={busyId === doc.id}
+                            onClick={() => handleAcknowledge(doc)}
+                          >
+                            {busyId === doc.id ? <span className="spinner" /> : "✓ Acknowledge"}
+                          </button>
+                          <button
+                            className="rev-btn"
+                            disabled={busyId === doc.id}
+                            onClick={() => handleRequestRevision(doc)}
+                            title="Send back to the uploader for a fix or more info, instead of rejecting outright"
+                          >
+                            ↺ Request revision
+                          </button>
+                          <button
+                            className="rej-btn"
+                            disabled={busyId === doc.id}
+                            onClick={() => handleReject(doc)}
+                          >
+                            ✕ Reject
+                          </button>
+                        </div>
+                      </div>
+                    )}
+
+                    {doc.status === "UPLOADED" && !showApprove && (
+                      <div className="doc-outcome doc-outcome-pending">Waiting on an approver</div>
+                    )}
+
+                    {canResubmit && (
+                      <div className="doc-actions">
+                        <input
+                          ref={(el) => {
+                            if (el) resubmitInputRefs.current.set(doc.id, el);
+                            else resubmitInputRefs.current.delete(doc.id);
+                          }}
+                          className="visually-hidden"
+                          type="file"
+                          onChange={(e) => handleResubmitFileChange(doc, e.target.files?.[0])}
+                        />
                         <button
-                          className="ack-btn"
+                          className="primary-btn"
                           disabled={busyId === doc.id}
-                          onClick={() => handleAcknowledge(doc)}
+                          onClick={() => resubmitInputRefs.current.get(doc.id)?.click()}
                         >
-                          {busyId === doc.id ? <span className="spinner" /> : "✓ Acknowledge"}
+                          {busyId === doc.id ? <span className="spinner" /> : "↩ Resubmit corrected file"}
+                        </button>
+                      </div>
+                    )}
+                    {doc.status === "NEEDS_REVISION" && !canResubmit && (
+                      <div className="doc-outcome doc-outcome-pending">Waiting on the uploader to resubmit</div>
+                    )}
+
+                    {showManage && (
+                      <div className="manage-actions">
+                        <input
+                          ref={(el) => {
+                            if (el) editInputRefs.current.set(doc.id, el);
+                            else editInputRefs.current.delete(doc.id);
+                          }}
+                          className="visually-hidden"
+                          type="file"
+                          onChange={(e) => handleEditFileChange(doc, e.target.files?.[0])}
+                        />
+                        <button
+                          className="manage-btn"
+                          disabled={busyId === doc.id}
+                          onClick={() => editInputRefs.current.get(doc.id)?.click()}
+                          title="Replace the file - resets this document to Awaiting review"
+                        >
+                          ✎ Edit
                         </button>
                         <button
-                          className="rej-btn"
+                          className="manage-btn manage-btn-danger"
                           disabled={busyId === doc.id}
-                          onClick={() => handleReject(doc)}
+                          onClick={() => handleDelete(doc)}
+                          title={`Soft delete - hidden immediately, purged for good after ${DELETED_RETENTION_DAYS} days`}
                         >
-                          ✕ Reject
+                          🗑 Delete
                         </button>
                       </div>
-                    </div>
-                  )}
-
-                  {doc.status === "UPLOADED" && !showApprove && (
-                    <div className="doc-outcome doc-outcome-pending">Waiting on an approver</div>
-                  )}
-
-                  {showManage && (
-                    <div className="manage-actions">
-                      <input
-                        ref={(el) => {
-                          if (el) editInputRefs.current.set(doc.id, el);
-                          else editInputRefs.current.delete(doc.id);
-                        }}
-                        className="visually-hidden"
-                        type="file"
-                        onChange={(e) => handleEditFileChange(doc, e.target.files?.[0])}
-                      />
-                      <button
-                        className="manage-btn"
-                        disabled={busyId === doc.id}
-                        onClick={() => editInputRefs.current.get(doc.id)?.click()}
-                        title="Replace the file - resets this document to Awaiting review"
-                      >
-                        ✎ Edit
-                      </button>
-                      <button
-                        className="manage-btn manage-btn-danger"
-                        disabled={busyId === doc.id}
-                        onClick={() => handleDelete(doc)}
-                      >
-                        🗑 Delete
-                      </button>
-                    </div>
-                  )}
-                </article>
-              ))}
+                    )}
+                  </article>
+                );
+              })}
             </div>
           )}
         </main>

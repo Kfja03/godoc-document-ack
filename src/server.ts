@@ -2,7 +2,12 @@ import { createApp } from "./app";
 import db from "./db";
 import { createUser, getUserByEmail } from "./lib/users";
 import { DEMO_USERS } from "./db/demoUsers";
-import { getRetentionDays, purgeExpiredRejectedDocuments } from "./lib/retention";
+import {
+  getDeletedRetentionDays,
+  getRejectedRetentionDays,
+  purgeExpiredRejectedDocuments,
+  purgeExpiredSoftDeletedDocuments,
+} from "./lib/retention";
 
 // Convenience for local/demo use (including `docker compose up`, where
 // there's no separate terminal to run `npm run seed` from): if the users
@@ -18,23 +23,28 @@ function seedDemoUsersIfEmpty() {
   console.log("No users found - seeded demo accounts (see README for credentials).");
 }
 
-// Naive in-process scheduler: run the purge once at boot, then every 6
-// hours. This is a deliberate shortcut for a take-home assessment - it
-// only runs while this one process is up, doesn't coordinate across
+// Naive in-process scheduler: run both purge sweeps once at boot, then
+// every 6 hours. This is a deliberate shortcut for a take-home assessment
+// - it only runs while this one process is up, doesn't coordinate across
 // multiple instances (each would run its own redundant sweep), and a
 // missed window because the process was down just means expired documents
 // live a bit longer, not that anything breaks. A real production version
 // would be a proper cron job / scheduled worker (e.g. a queue consumer or
-// a platform cron trigger) hitting the same purgeExpiredRejectedDocuments
-// function, which is already decoupled from HTTP and testable on its own.
+// a platform cron trigger) hitting the same purge functions, which are
+// already decoupled from HTTP and independently testable.
 function schedulePurgeJob() {
   const uploadDir = process.env.UPLOAD_DIR || "./uploads";
-  const retentionDays = getRetentionDays();
+  const rejectedRetentionDays = getRejectedRetentionDays();
+  const deletedRetentionDays = getDeletedRetentionDays();
 
   const run = () => {
-    const purged = purgeExpiredRejectedDocuments(uploadDir, retentionDays);
-    if (purged.length > 0) {
-      console.log(`Purged ${purged.length} rejected document(s) older than ${retentionDays} days.`);
+    const purgedRejected = purgeExpiredRejectedDocuments(uploadDir, rejectedRetentionDays);
+    if (purgedRejected.length > 0) {
+      console.log(`Purged ${purgedRejected.length} rejected document(s) older than ${rejectedRetentionDays} days.`);
+    }
+    const purgedDeleted = purgeExpiredSoftDeletedDocuments(uploadDir, deletedRetentionDays);
+    if (purgedDeleted.length > 0) {
+      console.log(`Purged ${purgedDeleted.length} soft-deleted document(s) older than ${deletedRetentionDays} days.`);
     }
   };
 
