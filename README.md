@@ -11,6 +11,7 @@ review it.
 - [Answering the assessment's three questions](#answering-the-assessments-three-questions)
 - [Tech stack & why](#tech-stack--why)
 - [Code repo structure](#code-repo-structure)
+- [Database schema & storage lifecycle](#database-schema--storage-lifecycle)
 - [Authentication & roles](#authentication--roles)
 - [State machine](#state-machine)
 - [Editing, deletion & retention](#editing-deletion--retention)
@@ -58,22 +59,14 @@ here, with links into the fuller sections below.
 
 **(1) Where and how the file is stored, and what metadata you track**
 
-- Storage: local disk via `multer.diskStorage`, under `UPLOAD_DIR`
-  (`uploads/` - a named Docker volume in the compose setup, so it survives
-  container restarts). The file on disk is named with a generated UUID plus
-  the original extension, **never** the user-supplied filename, to avoid
-  path traversal and filename collisions; the human-readable original name
-  lives only in the DB and is reattached on download.
-- Metadata tracked on the `documents` table: `id`, `original_filename`,
-  `stored_filename`, `mime_type`, `size_bytes`, `uploader_id`,
-  `created_at`, `status`, plus per-outcome fields -
-  `acknowledged_at`/`acknowledged_by_id`,
-  `rejected_at`/`rejected_by_id`/`rejection_reason`,
-  `revision_requested_at`/`revision_requested_by_id`/`revision_note`, and
-  `deleted_at` for soft delete. Full schema in `src/db/index.ts`.
-- Production alternative I'd actually use: S3/GCS with the DB storing the
-  object key instead of a local path - see [Tech stack & why](#tech-stack--why)
-  and [Known limitations](#known-limitations--whatid-add-next).
+- Short answer: the file goes to local disk under a generated (never
+  user-supplied) filename, and every field the app tracks - identity,
+  status, and who-did-what-when for every outcome - lives in one
+  `documents` table.
+- Full schema, an ERD, the file-naming/path-traversal reasoning, and how
+  the storage location would change in production are in
+  [Database schema & storage lifecycle](#database-schema--storage-lifecycle)
+  below.
 
 **(2) The state machine for a document's lifecycle**
 
@@ -236,6 +229,108 @@ tests/                Unit tests (validation, state machine, retention) +
                       integration tests via Supertest: auth, RBAC, visibility,
                       manage actions, revision workflow, retention sweeps
 ```
+
+## Database schema & storage lifecycle
+
+Two tables. Everything about a document - including who acted on it and
+when - lives on one row, rather than a separate audit/event table, since
+the brief only needs "current state plus who last changed it," not a full
+history of every intermediate action (see
+[Known limitations](#known-limitations--whatid-add-next) for what I'd add
+if that changed).
+
+```mermaid
+erDiagram
+    USERS ||--o{ DOCUMENTS : "uploads (uploader_id)"
+    USERS ||--o{ DOCUMENTS : "acknowledges (acknowledged_by_id)"
+    USERS ||--o{ DOCUMENTS : "rejects (rejected_by_id)"
+    USERS ||--o{ DOCUMENTS : "requests revision on (revision_requested_by_id)"
+
+    USERS {
+        text id PK
+        text name
+        text email UK
+        text password_hash
+        text role "UPLOAD_ONLY / APPROVE_ONLY / UPLOAD_AND_APPROVE"
+        text created_at
+    }
+
+    DOCUMENTS {
+        text id PK
+        text original_filename "human-readable, display + search only"
+        text stored_filename "generated UUID + ext, the real on-disk name"
+        text mime_type
+        int size_bytes
+        text uploader_id FK
+        text status "UPLOADED / ACKNOWLEDGED / REJECTED / NEEDS_REVISION"
+        text created_at
+        text acknowledged_at
+        text acknowledged_by_id FK
+        text rejected_at
+        text rejected_by_id FK
+        text rejection_reason
+        text revision_requested_at
+        text revision_requested_by_id FK
+        text revision_note
+        text deleted_at "soft delete marker, see below"
+    }
+```
+
+*(GitHub and most modern Markdown viewers render the block above as a
+diagram directly; see `src/db/index.ts` for the literal `CREATE TABLE`
+statements if your viewer doesn't render Mermaid.)*
+
+**Where the file itself lives, separate from its metadata:**
+
+- The file's bytes live on disk (`multer.diskStorage`), under `UPLOAD_DIR`
+  (`uploads/` - a named Docker volume in the compose setup, so it survives
+  container restarts).
+- The on-disk filename is a generated UUID plus the original extension,
+  **never** the user-supplied filename - this avoids both path traversal
+  (a filename like `../../etc/passwd` never reaches the filesystem layer)
+  and two different uploads silently overwriting each other if they
+  happen to share a name.
+- The human-readable original filename (`original_filename`) is *only*
+  ever stored in the DB, and is reattached as the download's
+  `Content-Disposition` header - the two identities (on-disk vs.
+  display) are deliberately decoupled.
+- Metadata (everything in the `documents` table above) lives entirely in
+  SQLite, separate from the file bytes - the DB never stores file
+  contents, only the `stored_filename` pointer to find them.
+
+**Data lifecycle - what exists today, and what I'd add for real storage
+tiering:**
+
+- What's built: two age-based transitions, both covered in
+  [Editing, deletion & retention](#editing-deletion--retention) - a
+  `REJECTED` document's *row and file* are hard-deleted after
+  `REJECTED_RETENTION_DAYS` (default 30), and a soft-deleted document's
+  row and file are hard-deleted after `DELETED_RETENTION_DAYS` (default
+  365). Both are "exists -> gone" transitions, not "hot -> cold" ones.
+- What's **not** built, and the honest gap this question is really
+  pointing at: an `ACKNOWLEDGED` document (the common end state for most
+  documents) sits on the same storage for as long as it exists - there's
+  no cheaper tier it ever moves to, even though it's realistically almost
+  never accessed again after the review is done, only kept for
+  audit/compliance purposes.
+- How I'd actually build that, if asked to: this is a case where I'd
+  **not** write custom application code for the transition at all. On
+  S3 (the storage backend I'd already move to for the reasons in
+  [Tech stack & why](#tech-stack--why)), I'd tag objects with their
+  document status and let an **S3 Lifecycle Configuration rule** - a
+  bucket-level policy, not app code - transition objects tagged
+  `status=ACKNOWLEDGED` to Infrequent Access after, say, 90 days, and to
+  Glacier Instant Retrieval after a year. S3 lifecycle rules run
+  server-side on a schedule AWS manages; the app's only responsibility
+  would be keeping the status tag in sync (already happening today via
+  the same `acknowledgeDocument` write) and, if compliance ever needed a
+  guaranteed retrieval-latency SLA, choosing Glacier Instant Retrieval
+  over classic Glacier so a download doesn't unexpectedly take hours.
+  This is squarely a "not implemented, but here's the design" answer -
+  local disk has no equivalent concept of storage classes, so building
+  it today would mean hand-rolling tier logic against a stack that's
+  going to be replaced by S3 anyway (see
+  [Known limitations](#known-limitations--whatid-add-next)).
 
 ## Authentication & roles
 
