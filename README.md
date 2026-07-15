@@ -394,8 +394,8 @@ UPLOADED ─────────────────────► ACKN
    │
    └──────────────────────────► NEEDS_REVISION
         REQUEST_REVISION              │
-                                       │ RESUBMIT (the uploader, or a lead,
-                                       │  sends a corrected file)
+                                      │ RESUBMIT (the uploader, or a lead,
+                                      │  sends a corrected file)
                                        ▼
                                   UPLOADED   (back into the queue for a
                                               fresh review cycle)
