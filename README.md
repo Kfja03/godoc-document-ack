@@ -21,16 +21,18 @@ review it.
 - [API overview](#api-overview)
 - [Assumptions](#assumptions)
 - [Edge cases considered](#edge-cases-considered)
-- [Known limitations & what I'd add next](#known-limitations--whatid-add-next)
+- [Known limitations & what I'd add next](#known-limitations--what-id-add-next)
 - [A note on the committed `.env`](#a-note-on-the-committed-env)
 
 ## Context & who the end users are
 
-The brief deliberately doesn't pin this down - it says "a document ... can
-be uploaded, and **a second party** can acknowledge having received/reviewed
-it," not "a patient uploads, a doctor acknowledges" or any other specific
-pairing. That's a real product decision I had to make, so here's the
-reasoning, upfront:
+The brief intentionally keeps the roles generic: it says a document can be
+uploaded, and **a second party** can acknowledge that it’s been received/
+reviewed—without specifying who that is (patient/doctor, etc.). I treated that
+as a product requirement, not a guess, and designed the flow around what the
+system needs to enforce: who can upload and who can review/acknowledge.
+Here’s how that decision shaped the implementation.
+
 
 - I modeled the two sides of the flow as **capabilities** (`can upload`,
   `can approve`) rather than fixed personas (`Patient`, `Doctor`, `Admin`).
@@ -105,9 +107,7 @@ here, with links into the fuller sections below.
 | Frontend | React + Vite + TypeScript | Minimal build setup, fast dev loop, satisfies the "modern JS framework" bonus without the overhead of a full Next.js app for a handful of screens. |
 | Tests | Jest + Supertest | Supertest drives the real Express app (routing, middleware, auth, validation, status codes) without a live server, and its `.agent()` persists cookies across requests so multi-step "login, then act" flows are easy to test. |
 
-**Alternatives I considered, and what I'd pick in production** - I expect
-to be asked "would you still choose this?" on the spot, so here's that
-answer written down rather than left to memory:
+**Alternatives I considered, and what I'd pick in production**
 
 - **Database - SQLite vs Postgres.** SQLite's single-writer model (WAL
   mode lets readers proceed during a write, but writes still serialize) is
@@ -145,11 +145,7 @@ answer written down rather than left to memory:
   where S3 does, plus durability guarantees and presigned URLs that let
   large uploads/downloads bypass the API process entirely.
 
-## Code repo structure
-
-*(Renamed from "Architecture" - this section is really a guide to the
-repo layout. The actual request/data flow is the diagram right below.)*
-
+## Architecture
 ```
  Browser (React SPA)
    |
@@ -188,6 +184,8 @@ in exactly one place (`listDocumentsForUser` / `canUserSeeDocument` in
 the rules, so adding a fourth capability or a fourth visibility case later
 is a change in one function, not a hunt through every route handler.
 
+
+## Code repo structure
 ```
 frontend/
   src/
@@ -233,11 +231,8 @@ tests/                Unit tests (validation, state machine, retention) +
 ## Database schema & storage lifecycle
 
 Two tables. Everything about a document - including who acted on it and
-when - lives on one row, rather than a separate audit/event table, since
-the brief only needs "current state plus who last changed it," not a full
-history of every intermediate action (see
-[Known limitations](#known-limitations--whatid-add-next) for what I'd add
-if that changed).
+when - lives on one row, rather than a separate audit/event table(see
+[Known limitations](#known-limitations--what-id-add-next).
 
 ```mermaid
 erDiagram
@@ -330,12 +325,12 @@ tiering:**
   local disk has no equivalent concept of storage classes, so building
   it today would mean hand-rolling tier logic against a stack that's
   going to be replaced by S3 anyway (see
-  [Known limitations](#known-limitations--whatid-add-next)).
+  [Known limitations](#known-limitations--what-id-add-next)).
 
 ## Authentication & roles
 
 Every user has exactly one role, set at account creation (there's no
-self-signup - see [Known limitations](#known-limitations--whatid-add-next)):
+self-signup - see [Known limitations](#known-limitations--what-id-add-next)):
 
 | Role | Can upload? | Can acknowledge / reject / request revision? | Can edit/delete *any* document? | Can see |
 |---|---|---|---|---|
@@ -428,7 +423,7 @@ UPLOADED ─────────────────────► ACKN
   flagged document - and uses the same atomic conditional-`UPDATE`
   pattern as every other transition, so a resubmit racing a lead's `Edit`
   on the same document can't corrupt either write.
-- **Reject vs. request-revision, in one line:** reject means "wrong
+- **Reject vs. request-revision:** reject means "wrong
   document, review is over, pick a different one to deal with"; request-
   revision means "this exact document is coming back, fix this one thing."
 - Transitions are defined once, declaratively, in `src/lib/stateMachine.ts`
@@ -540,7 +535,7 @@ happened:
   four demo accounts if the users table is empty.
 - `npm install` never runs on your machine in this path - it only runs
   inside the Docker build, isolated in the image layer.
-- Open **http://localhost:8080** and log in with any demo account from
+- Open **<http://localhost:8080>** and log in with any demo account from
   [Authentication & roles](#authentication--roles).
 - Data persists across `docker compose down` / `up` via two named volumes
   (`backend_data` for the SQLite file, `backend_uploads` for uploaded
@@ -582,7 +577,7 @@ npm run dev
 - **`npm install` here installs into your local machine's `node_modules`**
   - this is the non-Docker path. If you'd rather nothing touch your local
     machine, use Option A instead.
-- Open **http://localhost:5173** and log in with any demo account.
+- Open **<http://localhost:5173>** and log in with any demo account.
 
 ## Running tests
 
@@ -612,7 +607,7 @@ sense across two accounts at once:
 
 1. Open two browser windows (or one normal + one incognito - the session
    is a cookie, so two tabs in the same window share a login). Log in as
-   **alice@godoc.test** (upload only) in one, **bob@godoc.test** (approve
+   **<alice@godoc.test>** (upload only) in one, **<bob@godoc.test>** (approve
    only) in the other. The login screen has one-click buttons for each
    demo account.
 2. **As alice:** upload any PDF or image. It shows up as "Awaiting
@@ -628,12 +623,12 @@ sense across two accounts at once:
 6. **As alice:** upload a second document, then **as bob:** **✕ Reject**
    it (with or without a reason). Note the "auto-deletes in N days"
    countdown that appears on the card.
-7. Log in as **carol@godoc.test** (upload & approve, the seeded "lead") in
+7. Log in as **<carol@godoc.test>** (upload & approve, the seeded "lead") in
    a third tab - she sees every document regardless of uploader or status
    (not just her own + acknowledged), and gets **Edit** / **Delete**
    buttons on every card. Try editing a document she didn't upload, and
    deleting one - it disappears from every account's view immediately.
-8. Log in as **dana@godoc.test** (also upload-only) and confirm she
+8. Log in as **<dana@godoc.test>** (also upload-only) and confirm she
    *cannot* see alice's still-pending or needs-revision documents - only
    the one alice's had acknowledged. That's the visibility rule from
    [Authentication & roles](#authentication--roles) in action.
