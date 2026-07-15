@@ -146,7 +146,9 @@ here, with links into the fuller sections below.
   large uploads/downloads bypass the API process entirely.
 
 ## Architecture
-```
+
+```Bash
+
  Browser (React SPA)
    |
    |  fetch(..., { credentials: "include" })
@@ -184,9 +186,9 @@ in exactly one place (`listDocumentsForUser` / `canUserSeeDocument` in
 the rules, so adding a fourth capability or a fourth visibility case later
 is a change in one function, not a hunt through every route handler.
 
-
 ## Code repo structure
-```
+
+```Bash
 frontend/
   src/
     App.tsx           Auth-gated shell: renders Login until a session exists,
@@ -476,7 +478,7 @@ status transitions.
   (default 365) days later.
 - Why: a real recovery window at the data layer, without building a full
   audit-log/versioning system for a take-home. See
-  [Known limitations](#known-limitations--whatid-add-next) for the
+  [Known limitations](#known-limitations--what-id-add-next) for the
   missing piece - there's no *restore endpoint* yet, so today that window
   is only usable by someone with direct DB access clearing `deleted_at` by
   hand, not through the API.
@@ -687,7 +689,7 @@ All routes except `/api/auth/login` require a valid session cookie.
   isn't really a PDF) - validation checks the mime type multer/the browser
   reports, not the filename extension, but that's still spoofable via the
   `Content-Type` header; there's no magic-byte sniffing (see
-  [Known limitations](#known-limitations--whatid-add-next)).
+  [Known limitations](#known-limitations--what-id-add-next)).
 - **Guessing another user's document UUID** (e.g. a leaked download link)
   -> `GET /:id` and the download route re-run the same visibility check as
   the list endpoint and return `404`, not `403`, so a hidden document's
